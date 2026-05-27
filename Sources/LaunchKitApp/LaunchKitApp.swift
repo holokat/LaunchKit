@@ -50,8 +50,15 @@ final class LaunchKitAppModel {
     var isGeneratingMetadataDraft = false
     var isGeneratingIAPDraft = false
     var isGeneratingReleaseKit = false
+    var hasStartedReleaseKit = false
     var didBootstrap = false
     var releaseKitStatus = "Ready"
+    var releasePlanStatus: ReleaseKitSectionStatus = .pending
+    var metadataStatus: ReleaseKitSectionStatus = .pending
+    var screenshotStatus: ReleaseKitSectionStatus = .pending
+    var iapStatus: ReleaseKitSectionStatus = .pending
+    var riskStatus: ReleaseKitSectionStatus = .pending
+    var appleToolsStatus: ReleaseKitSectionStatus = .pending
     var isConnectingApple = false
     var aiConnectionState: ConnectionState = .notConnected
     var appleConnectionState: ConnectionState = .notConnected
@@ -82,6 +89,24 @@ final class LaunchKitAppModel {
 
     var selectedProjectName: String {
         selectedProject?.name ?? "No app selected"
+    }
+
+    var riskDisplayStatus: String {
+        switch riskStatus {
+        case .ready:
+            findings.isEmpty ? "Clear" : "\(findings.count)"
+        default:
+            riskStatus.rawValue
+        }
+    }
+
+    var appleToolsDisplayStatus: String {
+        switch appleToolsStatus {
+        case .ready:
+            appleConnectionState.rawValue
+        default:
+            appleToolsStatus.rawValue
+        }
     }
 
     func bootstrap() async {
@@ -318,11 +343,7 @@ final class LaunchKitAppModel {
         if scanResult?.rootURL != project.rootURL {
             scanResult = nil
             findings = []
-            generatedReleasePlan = nil
-            generatedScreenshotDraft = nil
-            generatedMetadataDraft = nil
-            generatedIAPDraft = nil
-            releaseKitStatus = "Ready"
+            resetReleaseKit()
         }
     }
 
@@ -330,11 +351,9 @@ final class LaunchKitAppModel {
         guard let project = selectedProject else { return }
         guard await ensureSelectedAgentConnected(phase: .planning, taskName: "generate the release kit") else { return }
 
+        resetReleaseKit()
+        hasStartedReleaseKit = true
         isGeneratingReleaseKit = true
-        isGeneratingReleasePlan = true
-        isGeneratingMetadataDraft = true
-        isGeneratingScreenshotDraft = true
-        isGeneratingIAPDraft = true
         defer {
             isGeneratingReleaseKit = false
             isGeneratingReleasePlan = false
@@ -345,45 +364,33 @@ final class LaunchKitAppModel {
 
         do {
             releaseKitStatus = "Reading \(project.name)"
+            riskStatus = .generating
             let result = try await scanner.scan(rootURL: project.rootURL)
             scanResult = result
             findings = result.findings
+            riskStatus = .ready
 
             releaseKitStatus = "Writing release plan"
+            releasePlanStatus = .generating
+            isGeneratingReleasePlan = true
             generatedReleasePlan = try await localAgentBridge.complete(
                 provider: selectedAIProvider,
                 prompt: localAgentBridge.releasePlanPrompt(provider: selectedAIProvider, scan: result),
                 workingDirectoryURL: result.rootURL
             )
+            releasePlanStatus = .ready
+            isGeneratingReleasePlan = false
 
-            releaseKitStatus = "Drafting metadata"
-            generatedMetadataDraft = try await localAgentBridge.complete(
-                provider: selectedAIProvider,
-                prompt: localAgentBridge.metadataDraftPrompt(
-                    provider: selectedAIProvider,
-                    scan: result,
-                    releasePlan: generatedReleasePlan
-                ),
-                workingDirectoryURL: result.rootURL
-            )
+            metadataStatus = .generating
+            screenshotStatus = .generating
+            iapStatus = .generating
+            appleToolsStatus = .generating
+            isGeneratingMetadataDraft = true
+            isGeneratingScreenshotDraft = true
+            isGeneratingIAPDraft = true
+            releaseKitStatus = "Generating review sections"
 
-            releaseKitStatus = "Designing screenshot direction"
-            let screenshotOutput = try await localAgentBridge.complete(
-                provider: selectedAIProvider,
-                prompt: localAgentBridge.screenshotDraftPrompt(provider: selectedAIProvider, scan: result),
-                workingDirectoryURL: result.rootURL
-            )
-            generatedScreenshotDraft = GeneratedScreenshotDraft(output: screenshotOutput)
-
-            releaseKitStatus = "Preparing purchases"
-            generatedIAPDraft = try await localAgentBridge.complete(
-                provider: selectedAIProvider,
-                prompt: localAgentBridge.iapDraftPrompt(provider: selectedAIProvider, scan: result),
-                workingDirectoryURL: result.rootURL
-            )
-
-            releaseKitStatus = "Checking local Apple tools"
-            await connectApple()
+            await generateRemainingReleaseKitSections(scan: result)
 
             releaseKitStatus = "Ready for review"
             events.insert(WorkflowEvent(
@@ -394,10 +401,132 @@ final class LaunchKitAppModel {
             ), at: 0)
         } catch {
             releaseKitStatus = "Stopped"
+            if riskStatus == .generating { riskStatus = .failed }
+            if releasePlanStatus == .generating { releasePlanStatus = .failed }
             events.insert(WorkflowEvent(
                 phase: .planning,
                 title: "Release kit generation failed",
                 detail: error.localizedDescription,
+                risk: .medium
+            ), at: 0)
+        }
+    }
+
+    private func resetReleaseKit() {
+        generatedReleasePlan = nil
+        generatedScreenshotDraft = nil
+        generatedMetadataDraft = nil
+        generatedIAPDraft = nil
+        hasStartedReleaseKit = false
+        releaseKitStatus = "Ready"
+        releasePlanStatus = .pending
+        metadataStatus = .pending
+        screenshotStatus = .pending
+        iapStatus = .pending
+        riskStatus = .pending
+        appleToolsStatus = .pending
+    }
+
+    private func generateRemainingReleaseKitSections(scan: ProjectScanResult) async {
+        let provider = selectedAIProvider
+        let releasePlan = generatedReleasePlan
+        await withTaskGroup(of: ReleaseKitGeneratedSection.self) { group in
+            group.addTask { [localAgentBridge] in
+                do {
+                    let output = try await localAgentBridge.complete(
+                        provider: provider,
+                        prompt: localAgentBridge.metadataDraftPrompt(
+                            provider: provider,
+                            scan: scan,
+                            releasePlan: releasePlan
+                        ),
+                        workingDirectoryURL: scan.rootURL
+                    )
+                    return .metadata(output)
+                } catch {
+                    return .failed(.metadata, error.localizedDescription)
+                }
+            }
+
+            group.addTask { [localAgentBridge] in
+                do {
+                    let output = try await localAgentBridge.complete(
+                        provider: provider,
+                        prompt: localAgentBridge.screenshotDraftPrompt(provider: provider, scan: scan),
+                        workingDirectoryURL: scan.rootURL
+                    )
+                    return .screenshots(output)
+                } catch {
+                    return .failed(.screenshots, error.localizedDescription)
+                }
+            }
+
+            group.addTask { [localAgentBridge] in
+                do {
+                    let output = try await localAgentBridge.complete(
+                        provider: provider,
+                        prompt: localAgentBridge.iapDraftPrompt(provider: provider, scan: scan),
+                        workingDirectoryURL: scan.rootURL
+                    )
+                    return .iap(output)
+                } catch {
+                    return .failed(.iap, error.localizedDescription)
+                }
+            }
+
+            group.addTask { [appleProbe] in
+                let environment = await appleProbe.probe()
+                return .appleTools(environment)
+            }
+
+            for await section in group {
+                applyGeneratedSection(section)
+            }
+        }
+    }
+
+    private func applyGeneratedSection(_ section: ReleaseKitGeneratedSection) {
+        switch section {
+        case let .metadata(output):
+            generatedMetadataDraft = output
+            metadataStatus = .ready
+            isGeneratingMetadataDraft = false
+            releaseKitStatus = "Metadata ready"
+        case let .screenshots(output):
+            generatedScreenshotDraft = GeneratedScreenshotDraft(output: output)
+            screenshotStatus = .review
+            isGeneratingScreenshotDraft = false
+            releaseKitStatus = "Screenshot draft ready"
+        case let .iap(output):
+            generatedIAPDraft = output
+            iapStatus = .review
+            isGeneratingIAPDraft = false
+            releaseKitStatus = "Purchases ready"
+        case let .appleTools(environment):
+            appleEnvironment = environment
+            appleConnectionState = environment.isUsable ? (environment.diagnostics.isEmpty ? .connected : .limited) : .failed
+            appleConnectionMessage = appleSummary(for: environment)
+            appleToolsStatus = .ready
+            releaseKitStatus = "Apple tools checked"
+        case let .failed(section, message):
+            switch section {
+            case .metadata:
+                metadataStatus = .failed
+                isGeneratingMetadataDraft = false
+            case .screenshots:
+                screenshotStatus = .failed
+                isGeneratingScreenshotDraft = false
+            case .iap:
+                iapStatus = .failed
+                isGeneratingIAPDraft = false
+            case .appleTools:
+                appleToolsStatus = .failed
+            }
+            releaseKitStatus = "\(section.title) failed"
+            events.insert(WorkflowEvent(
+                phase: section.phase,
+                title: "\(section.title) failed",
+                detail: message,
                 risk: .medium
             ), at: 0)
         }
@@ -563,6 +692,47 @@ enum ConnectionState: String {
     case connected = "Connected"
     case limited = "Limited"
     case failed = "Failed"
+}
+
+enum ReleaseKitSectionStatus: String {
+    case pending = "Pending"
+    case generating = "Generating"
+    case ready = "Ready"
+    case review = "Review"
+    case failed = "Failed"
+}
+
+enum ReleaseKitGeneratedSection: Sendable {
+    case metadata(String)
+    case screenshots(String)
+    case iap(String)
+    case appleTools(AppleDeveloperEnvironment)
+    case failed(ReleaseKitGeneratedSectionID, String)
+}
+
+enum ReleaseKitGeneratedSectionID: Sendable {
+    case metadata
+    case screenshots
+    case iap
+    case appleTools
+
+    var title: String {
+        switch self {
+        case .metadata: "Metadata"
+        case .screenshots: "Screenshots"
+        case .iap: "Purchases"
+        case .appleTools: "Apple tools"
+        }
+    }
+
+    var phase: WorkflowPhase {
+        switch self {
+        case .metadata: .metadata
+        case .screenshots: .screenshots
+        case .iap: .payments
+        case .appleTools: .building
+        }
+    }
 }
 
 struct GeneratedScreenshotDraft: Identifiable, Hashable {
@@ -962,13 +1132,10 @@ struct ReleaseKitReview: View {
                 ProgressPanel(status: model.releaseKitStatus)
             }
 
-            if model.generatedReleasePlan == nil,
-               model.generatedMetadataDraft == nil,
-               model.generatedScreenshotDraft == nil,
-               model.generatedIAPDraft == nil {
+            if !model.hasStartedReleaseKit {
                 FirstRunPanel()
             } else {
-                ReviewSummaryGrid(model: model)
+                AppStoreReviewList(model: model)
                 NextActionPanel(model: model)
             }
         }
@@ -1004,29 +1171,163 @@ struct FirstRunPanel: View {
     }
 }
 
-struct ReviewSummaryGrid: View {
+struct AppStoreReviewList: View {
     @Bindable var model: LaunchKitAppModel
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 14)], spacing: 14) {
-            ReviewCard(title: "Release Plan", icon: "checklist.checked", status: model.generatedReleasePlan == nil ? "Pending" : "Ready", text: model.generatedReleasePlan)
-            ReviewCard(title: "Metadata", icon: "text.alignleft", status: model.generatedMetadataDraft == nil ? "Pending" : "Ready", text: model.generatedMetadataDraft)
-            ReviewCard(title: "Purchases", icon: "creditcard", status: model.generatedIAPDraft == nil ? "Pending" : "Review", text: model.generatedIAPDraft)
-            ScreenshotReviewCard(draft: model.generatedScreenshotDraft)
-            ReviewCard(title: "Risks", icon: "exclamationmark.triangle", status: model.findings.isEmpty ? "Clear" : "\(model.findings.count)", text: model.findings.map { "\($0.title)\n\($0.explanation)" }.joined(separator: "\n\n"))
-            ReviewCard(title: "Apple Tools", icon: "apple.logo", status: model.appleConnectionState.rawValue, text: model.appleConnectionMessage)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Review")
+                .font(.title2.weight(.semibold))
+
+            AppStoreReviewSection(
+                title: "Release plan",
+                description: "What LaunchKit intends to prepare, fix, and gate before anything public changes.",
+                icon: "checklist.checked",
+                status: model.releasePlanStatus.rawValue,
+                content: model.generatedReleasePlan
+            )
+
+            AppStoreReviewSection(
+                title: "Title, subtitle, and positioning",
+                description: "The App Store name, subtitle, and short positioning copy.",
+                icon: "textformat",
+                status: model.metadataStatus.rawValue,
+                content: """
+                Name: \(model.selectedProject?.name ?? "Selected app")
+                Subtitle: \(metadataValue("Subtitle") ?? "Waiting for generated metadata.")
+                Promotional text: \(metadataValue("Promotional Text") ?? metadataValue("Promotional") ?? "Waiting for generated metadata.")
+                """
+            )
+
+            AppStoreReviewSection(
+                title: "Description",
+                description: "The full App Store description users will see before downloading.",
+                icon: "doc.text",
+                status: model.metadataStatus.rawValue,
+                content: metadataValue("Description") ?? model.generatedMetadataDraft
+            )
+
+            AppStoreReviewSection(
+                title: "Keywords",
+                description: "Search keywords for App Store discovery.",
+                icon: "number",
+                status: model.metadataStatus.rawValue,
+                content: metadataValue("Keywords")
+            )
+
+            AppStoreReviewSection(
+                title: "Release notes",
+                description: "What changed in this build.",
+                icon: "megaphone",
+                status: model.metadataStatus.rawValue,
+                content: metadataValue("Release Notes") ?? metadataValue("Release notes")
+            )
+
+            ScreenshotReviewSection(
+                draft: model.generatedScreenshotDraft,
+                status: model.screenshotStatus.rawValue
+            )
+
+            AppStoreReviewSection(
+                title: "Privacy",
+                description: "Privacy answers and disclosure notes to review before App Store Connect upload.",
+                icon: "hand.raised",
+                status: model.metadataStatus.rawValue,
+                content: metadataValue("Privacy Questions") ?? metadataValue("Privacy")
+            )
+
+            AppStoreReviewSection(
+                title: "Review notes",
+                description: "Reviewer instructions, demo account notes, and any gated functionality explanation.",
+                icon: "person.text.rectangle",
+                status: model.metadataStatus.rawValue,
+                content: metadataValue("Review Notes") ?? metadataValue("Review notes")
+            )
+
+            AppStoreReviewSection(
+                title: "In-app purchases",
+                description: "Products, subscription groups, StoreKit config, and sandbox testing notes.",
+                icon: "creditcard",
+                status: model.iapStatus.rawValue,
+                content: model.generatedIAPDraft
+            )
+
+            AppStoreReviewSection(
+                title: "Build, signing, and TestFlight",
+                description: "Local Apple tooling readiness before archive and upload.",
+                icon: "hammer",
+                status: model.appleToolsDisplayStatus,
+                content: model.appleConnectionMessage
+            )
+
+            AppStoreReviewSection(
+                title: "Compliance and fixes",
+                description: "Issues LaunchKit found that should be fixed or explicitly accepted before submission.",
+                icon: "exclamationmark.triangle",
+                status: model.riskDisplayStatus,
+                content: complianceText
+            )
         }
+    }
+
+    private var complianceText: String {
+        if model.riskStatus == .pending {
+            return "Waiting for project scan."
+        }
+        if model.findings.isEmpty {
+            return "No release blockers detected in the current scan."
+        }
+        return model.findings
+            .map { "\($0.title)\n\($0.explanation)\nFix: \($0.recommendedFix ?? "Review manually.")" }
+            .joined(separator: "\n\n")
+    }
+
+    private func metadataValue(_ label: String) -> String? {
+        guard let metadata = model.generatedMetadataDraft else { return nil }
+        let normalizedLabel = label.lowercased()
+        let lines = metadata
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+
+        for index in lines.indices {
+            let trimmed = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+            let lowercased = trimmed.lowercased()
+            guard lowercased.hasPrefix("\(normalizedLabel):") || lowercased == normalizedLabel else { continue }
+            let inlineValue = trimmed.dropFirst(label.count).trimmingCharacters(in: CharacterSet(charactersIn: ": ").union(.whitespacesAndNewlines))
+            if !inlineValue.isEmpty {
+                return inlineValue
+            }
+            let following = lines.dropFirst(index + 1)
+                .prefix { line in
+                    let lower = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    return !["subtitle:", "description:", "keywords:", "release notes:", "review notes:", "privacy questions:", "promotional text:"]
+                        .contains(where: lower.hasPrefix)
+                }
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return following.isEmpty ? nil : following
+        }
+        return nil
     }
 }
 
-struct ReviewCard: View {
+struct AppStoreReviewSection: View {
     let title: String
+    let description: String
     let icon: String
     let status: String
     let text: String?
 
+    init(title: String, description: String, icon: String, status: String, content: String?) {
+        self.title = title
+        self.description = description
+        self.icon = icon
+        self.status = status
+        self.text = content
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Label(title, systemImage: icon)
                     .font(.headline)
@@ -1037,14 +1338,16 @@ struct ReviewCard: View {
                     .padding(.vertical, 4)
                     .background(.tertiary, in: Capsule())
             }
-            Text(displayText)
+            Text(description)
                 .font(.callout)
                 .foregroundStyle(.secondary)
-                .lineLimit(8)
+            Text(displayText)
+                .font(.body)
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, minHeight: 170, alignment: .topLeading)
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
@@ -1054,21 +1357,25 @@ struct ReviewCard: View {
     }
 }
 
-struct ScreenshotReviewCard: View {
+struct ScreenshotReviewSection: View {
     let draft: GeneratedScreenshotDraft?
+    let status: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label("Screenshots", systemImage: "photo.on.rectangle")
+                Label("Images and screenshots", systemImage: "photo.on.rectangle")
                     .font(.headline)
                 Spacer()
-                Text(draft == nil ? "Pending" : "Draft")
+                Text(status)
                     .font(.caption.weight(.semibold))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(.tertiary, in: Capsule())
             }
+            Text("App Store screenshots, image direction, captions, and review notes before upload.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             if let draft {
                 Text(draft.title)
                     .font(.title3.weight(.semibold))
@@ -1077,14 +1384,13 @@ struct ScreenshotReviewCard: View {
                 Text(draft.visualDirection)
                     .font(.caption)
                     .foregroundStyle(.tertiary)
-                    .lineLimit(4)
             } else {
-                Text("Generate the release kit to create screenshot direction.")
+                Text("Waiting for screenshot direction.")
                     .foregroundStyle(.secondary)
             }
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, minHeight: 170, alignment: .topLeading)
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
