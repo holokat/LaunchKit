@@ -1388,18 +1388,75 @@ struct LaunchKitMainView: View {
     var body: some View {
         HStack(spacing: 0) {
             AppListPane(model: model)
-                .frame(width: 330)
-                .background(Color(nsColor: .controlBackgroundColor))
+                .frame(width: 360)
+                .background(.ultraThinMaterial)
 
             Divider()
+                .opacity(0.45)
 
             ReleaseKitPane(model: model)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(LaunchKitSurfaceBackground())
         .task {
             await model.bootstrap()
         }
+    }
+}
+
+struct LaunchKitSurfaceBackground: View {
+    var body: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+            LinearGradient(
+                colors: [
+                    Color.accentColor.opacity(0.10),
+                    Color(nsColor: .windowBackgroundColor).opacity(0.35),
+                    Color.black.opacity(0.08)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+        .ignoresSafeArea()
+    }
+}
+
+struct LaunchKitGlassCard: ViewModifier {
+    var padding: CGFloat = 22
+    var radius: CGFloat = 22
+
+    func body(content: Content) -> some View {
+        content
+            .padding(padding)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .stroke(.primary.opacity(0.07), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.08), radius: 14, y: 8)
+    }
+}
+
+extension View {
+    func launchKitGlassCard(padding: CGFloat = 22, radius: CGFloat = 18) -> some View {
+        modifier(LaunchKitGlassCard(padding: padding, radius: radius))
+    }
+}
+
+struct SectionStatusPill: View {
+    let status: String
+
+    var body: some View {
+        Text(status)
+            .font(.caption.weight(.bold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(.thinMaterial, in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(.primary.opacity(0.08), lineWidth: 1)
+            }
     }
 }
 
@@ -1410,9 +1467,9 @@ struct AppListPane: View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("LaunchKit")
-                    .font(.system(size: 26, weight: .semibold, design: .rounded))
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
                 Text(agentSummary)
-                    .font(.callout)
+                    .font(.headline)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
@@ -1423,7 +1480,7 @@ struct AppListPane: View {
 
             HStack {
                 Text("Apps")
-                    .font(.headline)
+                    .font(.title3.weight(.semibold))
                 Spacer()
                 if model.isDiscoveringProjects {
                     ProgressView()
@@ -1431,7 +1488,7 @@ struct AppListPane: View {
                 }
             }
             Text("Switch apps anytime. Each app keeps its own generated kit and running progress.")
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -1458,7 +1515,7 @@ struct AppListPane: View {
                 }
             }
         }
-        .padding(22)
+        .padding(28)
     }
 
     private var agentSummary: String {
@@ -1529,35 +1586,43 @@ struct AppListRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 12) {
+            HStack(spacing: 14) {
                 Image(systemName: icon)
-                    .font(.system(size: 18, weight: .medium))
-                    .frame(width: 28, height: 28)
-                    .background(.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                VStack(alignment: .leading, spacing: 3) {
+                    .font(.system(size: 22, weight: .semibold))
+                    .frame(width: 42, height: 42)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(.primary.opacity(0.08), lineWidth: 1)
+                    }
+                VStack(alignment: .leading, spacing: 5) {
                     Text(project.name)
-                        .font(.subheadline.weight(.semibold))
+                        .font(.headline.weight(.semibold))
                         .lineLimit(1)
                     Text(project.rootURL.path)
-                        .font(.caption)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 Spacer()
                 if let statusText {
                     Text(statusText)
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 4)
-                        .background(statusTint.opacity(0.14), in: Capsule())
+                        .font(.caption.weight(.bold))
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 7)
+                        .background(statusTint.opacity(0.16), in: Capsule())
                         .foregroundStyle(statusTint)
                 }
             }
-            .padding(10)
+            .padding(14)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(isSelected ? Color.accentColor.opacity(0.16) : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isSelected ? Color.accentColor.opacity(0.25) : .clear, lineWidth: 1)
+        }
     }
 
     private var icon: String {
@@ -1597,7 +1662,9 @@ struct ReleaseKitPane: View {
                     EmptyAppSelectionView()
                 }
             }
-            .padding(34)
+            .frame(maxWidth: 1220, alignment: .leading)
+            .padding(.horizontal, 44)
+            .padding(.vertical, 32)
         }
     }
 }
@@ -1625,25 +1692,26 @@ struct SelectedAppHeader: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(project.name)
-                        .font(.system(size: 38, weight: .semibold, design: .rounded))
+                        .font(.system(size: 44, weight: .bold, design: .rounded))
                     Text(project.rootURL.path)
-                        .font(.callout)
+                        .font(.title3)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 }
                 Spacer()
                 Text(project.projectType.rawValue)
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(.tertiary, in: Capsule())
+                    .font(.callout.weight(.bold))
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 8)
+                    .background(.thinMaterial, in: Capsule())
             }
 
             Button {
                 Task { await model.generateReleaseKit(for: project) }
             } label: {
                 Label(primaryActionTitle, systemImage: kit.isGeneratingReleaseKit ? "sparkles" : "wand.and.sparkles")
-                    .frame(minWidth: 220)
+                    .font(.headline)
+                    .frame(minWidth: 250, minHeight: 44)
             }
             .controlSize(.large)
             .buttonStyle(.borderedProminent)
@@ -1687,14 +1755,14 @@ struct ProgressPanel: View {
     let status: String
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 16) {
             ProgressView()
+                .scaleEffect(1.15)
             Text(status)
-                .font(.headline)
+                .font(.title3.weight(.semibold))
             Spacer()
         }
-        .padding(16)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .launchKitGlassCard(padding: 22, radius: 18)
     }
 }
 
@@ -1702,13 +1770,13 @@ struct FirstRunPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("One click creates the release kit.")
-                .font(.headline)
+                .font(.title3.weight(.semibold))
             Text("LaunchKit will inspect the app, draft the release plan, metadata, screenshot direction, IAP setup notes, and local Apple readiness, then stop for review.")
+                .font(.body)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(18)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .launchKitGlassCard()
     }
 }
 
@@ -1718,9 +1786,9 @@ struct AppStoreReviewList: View {
     let kit: ReleaseKitState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 18) {
             Text("Review")
-                .font(.title2.weight(.semibold))
+                .font(.system(size: 32, weight: .bold, design: .rounded))
 
             AppStoreReviewSection(
                 title: "Release plan",
@@ -1739,7 +1807,7 @@ struct AppStoreReviewList: View {
                 VStack(alignment: .leading, spacing: 12) {
                     ReviewTextField(label: "Name", text: metadataBinding(.name))
                     ReviewTextField(label: "Subtitle", text: metadataBinding(.subtitle))
-                    ReviewTextEditor(label: "Promotional text", text: metadataBinding(.promotionalText), minHeight: 76)
+                    ReviewTextEditor(label: "Promotional text", text: metadataBinding(.promotionalText), minHeight: 110)
                 }
             }
 
@@ -1749,7 +1817,7 @@ struct AppStoreReviewList: View {
                 icon: "doc.text",
                 status: kit.metadataStatus.rawValue
             ) {
-                ReviewTextEditor(label: "Description", text: metadataBinding(.description), minHeight: 170)
+                ReviewTextEditor(label: "Description", text: metadataBinding(.description), minHeight: 230)
             }
 
             EditableSectionHeader(
@@ -1767,7 +1835,7 @@ struct AppStoreReviewList: View {
                 icon: "megaphone",
                 status: kit.metadataStatus.rawValue
             ) {
-                ReviewTextEditor(label: "Release notes", text: metadataBinding(.releaseNotes), minHeight: 100)
+                ReviewTextEditor(label: "Release notes", text: metadataBinding(.releaseNotes), minHeight: 130)
             }
 
             ScreenshotReviewSection(
@@ -1783,7 +1851,7 @@ struct AppStoreReviewList: View {
                 icon: "hand.raised",
                 status: kit.metadataStatus.rawValue
             ) {
-                ReviewTextEditor(label: "Privacy notes", text: metadataBinding(.privacyNotes), minHeight: 120)
+                ReviewTextEditor(label: "Privacy notes", text: metadataBinding(.privacyNotes), minHeight: 150)
             }
 
             EditableSectionHeader(
@@ -1792,7 +1860,7 @@ struct AppStoreReviewList: View {
                 icon: "person.text.rectangle",
                 status: kit.metadataStatus.rawValue
             ) {
-                ReviewTextEditor(label: "Review notes", text: metadataBinding(.reviewNotes), minHeight: 110)
+                ReviewTextEditor(label: "Review notes", text: metadataBinding(.reviewNotes), minHeight: 140)
             }
 
             IAPReviewSection(model: model, projectID: project.id, form: kit.iapForm, status: kit.iapStatus.rawValue)
@@ -1855,28 +1923,23 @@ struct AppStoreReviewSection: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Label(title, systemImage: icon)
-                    .font(.headline)
+                    .font(.title3.weight(.semibold))
                 Spacer()
-                Text(status)
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(.tertiary, in: Capsule())
+                SectionStatusPill(status: status)
             }
             Text(description)
-                .font(.callout)
+                .font(.body)
                 .foregroundStyle(.secondary)
             Text(displayText)
-                .font(.body)
+                .font(.title3)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
+                .launchKitGlassCard(padding: 22, radius: 22)
         }
-        .padding(18)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var displayText: String {
@@ -1893,25 +1956,22 @@ struct EditableSectionHeader<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Label(title, systemImage: icon)
-                    .font(.headline)
+                    .font(.title3.weight(.semibold))
                 Spacer()
-                Text(status)
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(.tertiary, in: Capsule())
+                SectionStatusPill(status: status)
             }
             Text(description)
-                .font(.callout)
+                .font(.body)
                 .foregroundStyle(.secondary)
-            content
+            VStack(alignment: .leading, spacing: 14) {
+                content
+            }
+            .launchKitGlassCard(padding: 20, radius: 22)
         }
-        .padding(18)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -1920,13 +1980,22 @@ struct ReviewTextField: View {
     @Binding var text: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        HStack(alignment: .center, spacing: 18) {
             Text(label)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .font(.body.weight(.semibold))
+                .frame(width: 150, alignment: .leading)
             TextField(label, text: $text)
-                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 18, weight: .medium))
+                .textFieldStyle(.plain)
+                .padding(.horizontal, 16)
+                .frame(minHeight: 50)
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.78), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(.primary.opacity(0.08), lineWidth: 1)
+                }
         }
+        .padding(.vertical, 2)
     }
 }
 
@@ -1938,13 +2007,17 @@ struct ReviewTextEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .font(.body.weight(.semibold))
             TextEditor(text: $text)
-                .font(.body)
+                .font(.system(size: 18))
+                .scrollContentBackground(.hidden)
                 .frame(minHeight: minHeight)
-                .padding(8)
-                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .padding(14)
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.78), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(.primary.opacity(0.08), lineWidth: 1)
+                }
         }
     }
 }
@@ -1976,6 +2049,8 @@ struct ScreenshotReviewSection: View {
                     model.addScreenshotAsset(projectID: projectID)
                 } label: {
                     Label("Add image", systemImage: "plus")
+                        .font(.headline)
+                        .frame(minHeight: 34)
                 }
                 .buttonStyle(.bordered)
             }
@@ -1991,7 +2066,7 @@ struct ScreenshotAssetRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
             ScreenshotPreviewCard(asset: asset)
-                .frame(width: 178, height: 236)
+                .frame(width: 220, height: 292)
 
             VStack(alignment: .leading, spacing: 10) {
                 ReviewTextField(label: "Title", text: binding(.title))
@@ -2002,6 +2077,7 @@ struct ScreenshotAssetRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
             }
+            .frame(maxWidth: .infinity)
 
             Button {
                 model.deleteScreenshotAsset(projectID: projectID, assetID: asset.id)
@@ -2011,8 +2087,12 @@ struct ScreenshotAssetRow: View {
             .buttonStyle(.bordered)
             .help("Delete image")
         }
-        .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(16)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.54), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.primary.opacity(0.06), lineWidth: 1)
+        }
     }
 
     private func binding(_ field: ScreenshotAssetField) -> Binding<String> {
@@ -2044,6 +2124,17 @@ struct ScreenshotPreviewCard: View {
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(.black.opacity(0.18))
+                .frame(width: 118, height: 218)
+                .overlay(alignment: .top) {
+                    Capsule()
+                        .fill(.white.opacity(0.22))
+                        .frame(width: 42, height: 5)
+                        .padding(.top, 10)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .padding(14)
             VStack(alignment: .leading, spacing: 8) {
                 Spacer()
                 Text(asset.title)
@@ -2081,6 +2172,8 @@ struct IAPReviewSection: View {
             VStack(alignment: .leading, spacing: 12) {
                 Toggle("Use in-app purchases for this release", isOn: enabledBinding)
                     .toggleStyle(.switch)
+                    .font(.body.weight(.semibold))
+                    .padding(.vertical, 4)
 
                 ReviewTextEditor(label: "Setup note", text: setupNoteBinding, minHeight: 78)
 
@@ -2093,6 +2186,8 @@ struct IAPReviewSection: View {
                         model.addIAPProduct(projectID: projectID)
                     } label: {
                         Label("Add product", systemImage: "plus")
+                            .font(.headline)
+                            .frame(minHeight: 34)
                     }
                     .buttonStyle(.bordered)
                 }
@@ -2124,7 +2219,7 @@ struct IAPProductRow: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text(product.displayName)
-                    .font(.headline)
+                    .font(.title3.weight(.semibold))
                 Spacer()
                 Button {
                     model.deleteIAPProduct(projectID: projectID, productID: product.id)
@@ -2153,8 +2248,12 @@ struct IAPProductRow: View {
 
             ReviewTextEditor(label: "Review note", text: textBinding(.reviewNote), minHeight: 70)
         }
-        .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(16)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.54), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.primary.opacity(0.06), lineWidth: 1)
+        }
     }
 
     private func textBinding(_ field: IAPProductField) -> Binding<String> {
