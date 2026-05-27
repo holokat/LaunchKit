@@ -35,8 +35,46 @@ final class LaunchKitAppModel {
     var findings: [DiagnosticFinding] = LaunchKitSampleData.findings
     var plannedActions: [LaunchKitAction] = LaunchKitSampleData.actions
     var events: [WorkflowEvent] = LaunchKitSampleData.events
+    var discoveredProjects: [DiscoveredProjectCandidate] = []
+    var isDiscoveringProjects = false
+    var aiConnectionState: ConnectionState = .notConnected
+    var appleConnectionState: ConnectionState = .notConnected
 
     private let scanner = FileSystemProjectScanner()
+    private let discoveryService = ProjectDiscoveryService()
+
+    func connectAI() {
+        aiConnectionState = .needsImplementation
+        events.insert(WorkflowEvent(
+            phase: .onboarding,
+            title: "AI connection needs provider wiring",
+            detail: "The production app should open Codex/Claude provider auth first, then store the local credential reference in Keychain.",
+            risk: .medium
+        ), at: 0)
+    }
+
+    func connectApple() {
+        appleConnectionState = .needsImplementation
+        events.insert(WorkflowEvent(
+            phase: .onboarding,
+            title: "Apple connection needs guided setup",
+            detail: "LaunchKit should prefer a guided Apple connection and keep API-key import as the advanced fallback for API-only automation.",
+            risk: .medium
+        ), at: 0)
+    }
+
+    func discoverProjects() async {
+        isDiscoveringProjects = true
+        let projects = await discoveryService.discover()
+        discoveredProjects = projects
+        isDiscoveringProjects = false
+        events.insert(WorkflowEvent(
+            phase: .scanning,
+            title: "Project discovery completed",
+            detail: projects.isEmpty ? "No Apple projects found in common developer folders." : "Found \(projects.count) candidate projects.",
+            risk: .informational
+        ), at: 0)
+    }
 
     func scan(path: String) async {
         do {
@@ -61,6 +99,12 @@ final class LaunchKitAppModel {
             selectedScreen = .scanResults
         }
     }
+}
+
+enum ConnectionState: String {
+    case notConnected = "Not connected"
+    case connected = "Connected"
+    case needsImplementation = "Needs implementation"
 }
 
 enum LaunchKitScreen: String, CaseIterable, Identifiable {
@@ -142,32 +186,175 @@ struct Sidebar: View {
 
 struct HomeView: View {
     @Bindable var model: LaunchKitAppModel
-    @State private var projectPath = FileManager.default.currentDirectoryPath
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 HeaderBlock(
-                    eyebrow: "AI-powered App Store Release Agent",
-                    title: "Ship Apple apps without signing hell.",
-                    subtitle: "LaunchKit scans local projects, explains risk in plain English, prepares reversible fixes, and keeps public, legal, and revenue-impacting actions behind review gates."
+                    eyebrow: "Release cockpit",
+                    title: "Connect AI. Find your apps. Ship with review gates.",
+                    subtitle: "LaunchKit should discover local Apple projects automatically, let AI generate the release plan and assets, and ask for approval only when a step affects code, Apple state, public metadata, privacy, or revenue."
                 )
 
-                HStack(spacing: 16) {
-                    TextField("Project path", text: $projectPath)
-                        .textFieldStyle(.roundedBorder)
-                    Button {
-                        Task { await model.scan(path: projectPath) }
-                    } label: {
-                        Label("Scan Project", systemImage: "magnifyingglass")
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), spacing: 16)], spacing: 16) {
+                    OnboardingStepCard(
+                        number: "1",
+                        title: "Connect Codex or Claude",
+                        status: model.aiConnectionState.rawValue,
+                        bodyText: "The release agent needs an AI provider before it can explain findings, generate fixes, draft metadata, and regenerate screenshots or icons.",
+                        buttonTitle: "Connect AI",
+                        systemImage: "sparkles"
+                    ) {
+                        model.connectAI()
                     }
-                    .buttonStyle(.borderedProminent)
+
+                    OnboardingStepCard(
+                        number: "2",
+                        title: "Find projects automatically",
+                        status: model.isDiscoveringProjects ? "Searching" : "\(model.discoveredProjects.count) found",
+                        bodyText: "LaunchKit looks in common developer folders for Xcode, SwiftPM, React Native, Flutter, Capacitor, Tuist, and XcodeGen projects.",
+                        buttonTitle: model.isDiscoveringProjects ? "Searching..." : "Find Projects",
+                        systemImage: "folder.badge.gearshape"
+                    ) {
+                        Task { await model.discoverProjects() }
+                    }
+
+                    OnboardingStepCard(
+                        number: "3",
+                        title: "Connect Apple",
+                        status: model.appleConnectionState.rawValue,
+                        bodyText: "Use the easiest Apple connection available, then fall back to App Store Connect API keys only when Apple requires API-only automation.",
+                        buttonTitle: "Connect Apple",
+                        systemImage: "apple.logo"
+                    ) {
+                        model.connectApple()
+                    }
                 }
+
+                if !model.discoveredProjects.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Detected Projects")
+                            .font(.headline)
+                        ForEach(model.discoveredProjects) { project in
+                            DiscoveredProjectRow(project: project) {
+                                Task { await model.scan(path: project.rootURL.path) }
+                            }
+                        }
+                    }
+                }
+
+                AutomationPreview()
 
                 WorkflowTimeline(events: model.events)
             }
             .padding(32)
         }
+    }
+}
+
+struct OnboardingStepCard: View {
+    let number: String
+    let title: String
+    let status: String
+    let bodyText: String
+    let buttonTitle: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(number)
+                    .font(.caption.weight(.bold))
+                    .frame(width: 24, height: 24)
+                    .background(.tint.opacity(0.16), in: Circle())
+                Text(status)
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.tertiary, in: Capsule())
+                Spacer()
+                Image(systemName: systemImage)
+                    .foregroundStyle(.secondary)
+            }
+            Text(title)
+                .font(.headline)
+            Text(bodyText)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(action: action) {
+                Label(buttonTitle, systemImage: systemImage)
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct DiscoveredProjectRow: View {
+    let project: DiscoveredProjectCandidate
+    let action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "shippingbox")
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(project.name)
+                    .font(.subheadline.weight(.semibold))
+                Text(project.rootURL.path)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Text(project.projectType.rawValue)
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.tertiary, in: Capsule())
+            Button("Open Release") {
+                action()
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct AutomationPreview: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("AI-Generated Release Flow")
+                .font(.headline)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 12)], spacing: 12) {
+                FlowChip(title: "Scan and explain", icon: "text.magnifyingglass")
+                FlowChip(title: "Auto-fix safe issues", icon: "wand.and.sparkles")
+                FlowChip(title: "Regenerate screenshots", icon: "photo.stack")
+                FlowChip(title: "Draft metadata", icon: "doc.text")
+                FlowChip(title: "Prepare IAPs", icon: "creditcard")
+                FlowChip(title: "Submit after approval", icon: "paperplane")
+            }
+        }
+    }
+}
+
+struct FlowChip: View {
+    let title: String
+    let icon: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+            Text(title)
+                .font(.callout.weight(.medium))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -279,11 +466,11 @@ struct PlaceholderWorkflowView: View {
 struct SettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HeaderBlock(
-                eyebrow: "Local-first secrets",
-                title: "Settings & Secrets",
-                subtitle: "Provider tokens, App Store Connect API keys, signing material, and repository access must stay in Keychain-backed local storage by default."
-            )
+        HeaderBlock(
+            eyebrow: "Local-first secrets",
+            title: "Settings & Secrets",
+            subtitle: "Provider credentials, Apple connection state, signing material, and repository access must stay in Keychain-backed local storage by default. API-key import should be an advanced fallback, not the first thing users see."
+        )
             Spacer()
         }
         .padding(32)
