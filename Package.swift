@@ -104,6 +104,7 @@ let package = Package(
             name: "LaunchKitTests",
             dependencies: [
                 "LaunchKitAgentCore",
+                "LaunchKitAI",
                 "LaunchKitBuild",
                 "LaunchKitCore",
                 "LaunchKitDiff",

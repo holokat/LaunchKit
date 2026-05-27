@@ -40,6 +40,7 @@ public struct ProjectDiscoveryService: Sendable {
             let childURLs = candidateRoots(under: root)
             for childURL in childURLs where !seen.contains(childURL.path) {
                 seen.insert(childURL.path)
+                guard looksLikeProjectRoot(childURL) else { continue }
                 guard let result = try? await scanner.scan(rootURL: childURL) else { continue }
                 guard result.projectType != .unknown else { continue }
                 candidates.append(DiscoveredProjectCandidate(
@@ -61,8 +62,7 @@ public struct ProjectDiscoveryService: Sendable {
             home.appending(path: "code", directoryHint: .isDirectory),
             home.appending(path: "Code", directoryHint: .isDirectory),
             home.appending(path: "Developer", directoryHint: .isDirectory),
-            home.appending(path: "Projects", directoryHint: .isDirectory),
-            home.appending(path: "Documents", directoryHint: .isDirectory)
+            home.appending(path: "Projects", directoryHint: .isDirectory)
         ]
     }
 
@@ -77,16 +77,67 @@ public struct ProjectDiscoveryService: Sendable {
             return candidates
         }
 
-        for child in children {
+        for child in children.prefix(160) {
             guard let values = try? child.resourceValues(forKeys: [.isDirectoryKey]), values.isDirectory == true else {
                 continue
             }
-            guard ![".build", "DerivedData", "Library", "Applications"].contains(child.lastPathComponent) else {
+            guard !ignoredDirectoryNames.contains(child.lastPathComponent) else {
                 continue
             }
             candidates.append(child)
         }
         return candidates
     }
+
+    private func looksLikeProjectRoot(_ url: URL) -> Bool {
+        let fileManager = FileManager.default
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+
+        let names = Set(children.map(\.lastPathComponent))
+        if !names.isDisjoint(with: projectRootMarkers) {
+            return true
+        }
+        if children.contains(where: { $0.pathExtension == "xcodeproj" || $0.pathExtension == "xcworkspace" }) {
+            return true
+        }
+        if names.contains("ios"),
+           let iosChildren = try? fileManager.contentsOfDirectory(
+                at: url.appending(path: "ios", directoryHint: .isDirectory),
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+           ),
+           iosChildren.contains(where: { $0.pathExtension == "xcodeproj" || $0.pathExtension == "xcworkspace" }) {
+            return true
+        }
+        return false
+    }
 }
 
+private let ignoredDirectoryNames = Set([
+    ".build",
+    ".git",
+    "Applications",
+    "DerivedData",
+    "Library",
+    "node_modules",
+    "Pods"
+])
+
+private let projectRootMarkers = Set([
+    "Package.swift",
+    "Podfile",
+    "Project.swift",
+    "Workspace.swift",
+    "project.yml",
+    "project.yaml",
+    "pubspec.yaml",
+    "package.json",
+    "capacitor.config.ts",
+    "capacitor.config.json"
+])

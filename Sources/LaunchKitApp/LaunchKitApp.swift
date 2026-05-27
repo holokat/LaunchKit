@@ -38,9 +38,12 @@ final class LaunchKitAppModel {
     var events: [WorkflowEvent] = LaunchKitSampleData.events
     var discoveredProjects: [DiscoveredProjectCandidate] = []
     var isDiscoveringProjects = false
-    var isCheckingCodex = false
-    var isInstallingCodex = false
-    var isLoggingIntoCodex = false
+    var selectedAIProvider: LocalAgentProvider = .codex {
+        didSet { aiConnectionState = connectionState(for: selectedAIProvider) }
+    }
+    var isCheckingAgent = false
+    var isInstallingAgent = false
+    var isLoggingIntoAgent = false
     var isGeneratingReleasePlan = false
     var isGeneratingScreenshotDraft = false
     var isGeneratingMetadataDraft = false
@@ -48,8 +51,15 @@ final class LaunchKitAppModel {
     var isConnectingApple = false
     var aiConnectionState: ConnectionState = .notConnected
     var appleConnectionState: ConnectionState = .notConnected
-    var codexAuthenticationState: CodexAuthenticationState?
-    var codexStatusMessage = "Codex status has not been checked yet."
+    var agentAuthenticationStates: [LocalAgentProvider: LocalAgentAuthenticationState] = [:]
+    var agentConnectionStates: [LocalAgentProvider: ConnectionState] = [
+        .codex: .notConnected,
+        .claude: .notConnected
+    ]
+    var agentStatusMessages: [LocalAgentProvider: String] = [
+        .codex: "Codex status has not been checked yet.",
+        .claude: "Claude Code status has not been checked yet."
+    ]
     var appleEnvironment: AppleDeveloperEnvironment?
     var appleConnectionMessage = "Apple developer environment has not been checked yet."
     var generatedReleasePlan: String?
@@ -59,76 +69,86 @@ final class LaunchKitAppModel {
 
     private let scanner = FileSystemProjectScanner()
     private let discoveryService = ProjectDiscoveryService()
-    private let codexClient = CodexCLIClient()
+    private let localAgentBridge = LocalAgentBridge()
     private let appleProbe = AppleDeveloperEnvironmentProbe()
 
-    func refreshCodexStatus() async {
-        isCheckingCodex = true
-        let state = await codexClient.probeAuthentication()
-        applyCodexState(state)
-        isCheckingCodex = false
+    func refreshAgentStatus(provider: LocalAgentProvider) async {
+        isCheckingAgent = true
+        let state = await localAgentBridge.probeAuthentication(provider: provider)
+        applyAgentState(state)
+        isCheckingAgent = false
     }
 
-    func installCodex() async {
-        isInstallingCodex = true
-        aiConnectionState = .installing
+    func refreshAllAgentStatuses() async {
+        isCheckingAgent = true
+        async let codex = localAgentBridge.probeAuthentication(provider: .codex)
+        async let claude = localAgentBridge.probeAuthentication(provider: .claude)
+        await [codex, claude].forEach(applyAgentState)
+        isCheckingAgent = false
+    }
+
+    func installAgent(provider: LocalAgentProvider) async {
+        selectedAIProvider = provider
+        isInstallingAgent = true
+        setConnectionState(.installing, for: provider)
         do {
-            let state = try await codexClient.installWithNPM()
-            applyCodexState(state)
+            let state = try await localAgentBridge.installWithNPM(provider: provider)
+            applyAgentState(state)
             events.insert(WorkflowEvent(
                 phase: .onboarding,
-                title: "Codex CLI installed",
-                detail: state.executablePath ?? "Codex is available on this Mac.",
+                title: "\(provider.displayName) installed",
+                detail: state.executablePath ?? "\(provider.displayName) is available on this Mac.",
                 risk: .informational
             ), at: 0)
         } catch {
-            aiConnectionState = .failed
-            codexStatusMessage = error.localizedDescription
+            setConnectionState(.failed, for: provider)
+            agentStatusMessages[provider] = error.localizedDescription
             events.insert(WorkflowEvent(
                 phase: .onboarding,
-                title: "Codex install failed",
+                title: "\(provider.displayName) install failed",
                 detail: error.localizedDescription,
                 risk: .medium
             ), at: 0)
         }
-        isInstallingCodex = false
+        isInstallingAgent = false
     }
 
-    func connectAI(deviceAuth: Bool = false) async {
-        isLoggingIntoCodex = true
-        aiConnectionState = .checking
-        let currentState = await codexClient.probeAuthentication()
-        applyCodexState(currentState)
+    func connectAI(provider: LocalAgentProvider, mode: LocalAgentLoginMode = .browser) async {
+        selectedAIProvider = provider
+        isLoggingIntoAgent = true
+        setConnectionState(.checking, for: provider)
+        let currentState = await localAgentBridge.probeAuthentication(provider: provider)
+        applyAgentState(currentState)
 
         guard currentState.isInstalled else {
-            isLoggingIntoCodex = false
+            isLoggingIntoAgent = false
             return
         }
         guard !currentState.isLoggedIn else {
-            isLoggingIntoCodex = false
+            isLoggingIntoAgent = false
             return
         }
 
         do {
-            let state = try await codexClient.login(deviceAuth: deviceAuth)
-            applyCodexState(state)
+            let state = try await localAgentBridge.login(provider: provider, mode: mode)
+            applyAgentState(state)
             events.insert(WorkflowEvent(
                 phase: .onboarding,
-                title: "Codex authenticated",
-                detail: "LaunchKit can now route AI analysis through the local ChatGPT-authenticated Codex CLI.",
+                title: "\(provider.displayName) authenticated",
+                detail: "LaunchKit can now route AI analysis through local \(provider.subscriptionLabel).",
                 risk: .informational
             ), at: 0)
         } catch {
-            aiConnectionState = .failed
-            codexStatusMessage = error.localizedDescription
+            setConnectionState(.failed, for: provider)
+            agentStatusMessages[provider] = error.localizedDescription
             events.insert(WorkflowEvent(
                 phase: .onboarding,
-                title: "Codex login did not complete",
+                title: "\(provider.displayName) login did not complete",
                 detail: error.localizedDescription,
                 risk: .medium
             ), at: 0)
         }
-        isLoggingIntoCodex = false
+        isLoggingIntoAgent = false
     }
 
     func connectApple() async {
@@ -148,19 +168,20 @@ final class LaunchKitAppModel {
     }
 
     func generateReleasePlan() async {
-        guard await ensureCodexConnected(phase: .planning, taskName: "generate a release plan") else { return }
+        guard await ensureSelectedAgentConnected(phase: .planning, taskName: "generate a release plan") else { return }
 
         isGeneratingReleasePlan = true
         do {
-            let prompt = codexClient.releasePlanPrompt(scan: scanResult)
-            generatedReleasePlan = try await codexClient.complete(
+            let prompt = localAgentBridge.releasePlanPrompt(provider: selectedAIProvider, scan: scanResult)
+            generatedReleasePlan = try await localAgentBridge.complete(
+                provider: selectedAIProvider,
                 prompt: prompt,
                 workingDirectoryURL: scanResult?.rootURL
             )
             selectedScreen = .releasePlan
             events.insert(WorkflowEvent(
                 phase: .planning,
-                title: "Codex generated release plan",
+                title: "\(selectedAIProvider.displayName) generated release plan",
                 detail: "Generated a review-gated release plan from local scan evidence.",
                 risk: .informational
             ), at: 0)
@@ -176,19 +197,20 @@ final class LaunchKitAppModel {
     }
 
     func regenerateScreenshotDraft() async {
-        guard await ensureCodexConnected(phase: .screenshots, taskName: "regenerate screenshots") else { return }
+        guard await ensureSelectedAgentConnected(phase: .screenshots, taskName: "regenerate screenshots") else { return }
 
         isGeneratingScreenshotDraft = true
         do {
-            let prompt = codexClient.screenshotDraftPrompt(scan: scanResult)
-            let output = try await codexClient.complete(
+            let prompt = localAgentBridge.screenshotDraftPrompt(provider: selectedAIProvider, scan: scanResult)
+            let output = try await localAgentBridge.complete(
+                provider: selectedAIProvider,
                 prompt: prompt,
                 workingDirectoryURL: scanResult?.rootURL
             )
             generatedScreenshotDraft = GeneratedScreenshotDraft(output: output)
             events.insert(WorkflowEvent(
                 phase: .screenshots,
-                title: "Codex regenerated screenshot draft",
+                title: "\(selectedAIProvider.displayName) regenerated screenshot draft",
                 detail: generatedScreenshotDraft?.caption ?? "Generated a new screenshot concept.",
                 risk: .informational
             ), at: 0)
@@ -204,19 +226,24 @@ final class LaunchKitAppModel {
     }
 
     func generateMetadataDraft() async {
-        guard await ensureCodexConnected(phase: .metadata, taskName: "draft App Store metadata") else { return }
+        guard await ensureSelectedAgentConnected(phase: .metadata, taskName: "draft App Store metadata") else { return }
 
         isGeneratingMetadataDraft = true
         do {
-            let prompt = codexClient.metadataDraftPrompt(scan: scanResult, releasePlan: generatedReleasePlan)
-            generatedMetadataDraft = try await codexClient.complete(
+            let prompt = localAgentBridge.metadataDraftPrompt(
+                provider: selectedAIProvider,
+                scan: scanResult,
+                releasePlan: generatedReleasePlan
+            )
+            generatedMetadataDraft = try await localAgentBridge.complete(
+                provider: selectedAIProvider,
                 prompt: prompt,
                 workingDirectoryURL: scanResult?.rootURL
             )
             selectedScreen = .metadata
             events.insert(WorkflowEvent(
                 phase: .metadata,
-                title: "Codex generated metadata draft",
+                title: "\(selectedAIProvider.displayName) generated metadata draft",
                 detail: "Generated editable App Store copy with assumptions and approval gates.",
                 risk: .informational
             ), at: 0)
@@ -232,19 +259,20 @@ final class LaunchKitAppModel {
     }
 
     func generateIAPDraft() async {
-        guard await ensureCodexConnected(phase: .payments, taskName: "prepare IAP drafts") else { return }
+        guard await ensureSelectedAgentConnected(phase: .payments, taskName: "prepare IAP drafts") else { return }
 
         isGeneratingIAPDraft = true
         do {
-            let prompt = codexClient.iapDraftPrompt(scan: scanResult)
-            generatedIAPDraft = try await codexClient.complete(
+            let prompt = localAgentBridge.iapDraftPrompt(provider: selectedAIProvider, scan: scanResult)
+            generatedIAPDraft = try await localAgentBridge.complete(
+                provider: selectedAIProvider,
                 prompt: prompt,
                 workingDirectoryURL: scanResult?.rootURL
             )
             selectedScreen = .payments
             events.insert(WorkflowEvent(
                 phase: .payments,
-                title: "Codex generated IAP draft",
+                title: "\(selectedAIProvider.displayName) generated IAP draft",
                 detail: "Generated local StoreKit and approval-gated monetization setup notes.",
                 risk: .informational
             ), at: 0)
@@ -272,15 +300,15 @@ final class LaunchKitAppModel {
         selectedScreen = .releasePlan
     }
 
-    private func ensureCodexConnected(phase: WorkflowPhase, taskName: String) async -> Bool {
-        if aiConnectionState != .connected {
-            await refreshCodexStatus()
+    private func ensureSelectedAgentConnected(phase: WorkflowPhase, taskName: String) async -> Bool {
+        if connectionState(for: selectedAIProvider) != .connected {
+            await refreshAgentStatus(provider: selectedAIProvider)
         }
-        guard aiConnectionState == .connected else {
+        guard connectionState(for: selectedAIProvider) == .connected else {
             events.insert(WorkflowEvent(
                 phase: phase,
-                title: "Codex login required",
-                detail: "Connect Codex before asking LaunchKit to \(taskName).",
+                title: "\(selectedAIProvider.displayName) login required",
+                detail: "Connect \(selectedAIProvider.displayName) before asking LaunchKit to \(taskName).",
                 risk: .medium
             ), at: 0)
             return false
@@ -288,15 +316,34 @@ final class LaunchKitAppModel {
         return true
     }
 
-    private func applyCodexState(_ state: CodexAuthenticationState) {
-        codexAuthenticationState = state
-        codexStatusMessage = state.statusText
+    func connectionState(for provider: LocalAgentProvider) -> ConnectionState {
+        agentConnectionStates[provider] ?? .notConnected
+    }
+
+    func statusMessage(for provider: LocalAgentProvider) -> String {
+        agentStatusMessages[provider] ?? "\(provider.displayName) status has not been checked yet."
+    }
+
+    func authenticationState(for provider: LocalAgentProvider) -> LocalAgentAuthenticationState? {
+        agentAuthenticationStates[provider]
+    }
+
+    private func applyAgentState(_ state: LocalAgentAuthenticationState) {
+        agentAuthenticationStates[state.provider] = state
+        agentStatusMessages[state.provider] = state.statusText
         if !state.isInstalled {
-            aiConnectionState = .missing
+            setConnectionState(.missing, for: state.provider)
         } else if state.isLoggedIn {
-            aiConnectionState = .connected
+            setConnectionState(.connected, for: state.provider)
         } else {
-            aiConnectionState = .loginRequired
+            setConnectionState(.loginRequired, for: state.provider)
+        }
+    }
+
+    private func setConnectionState(_ state: ConnectionState, for provider: LocalAgentProvider) {
+        agentConnectionStates[provider] = state
+        if provider == selectedAIProvider {
+            aiConnectionState = state
         }
     }
 
@@ -315,16 +362,26 @@ final class LaunchKitAppModel {
         return parts.joined(separator: ". ")
     }
 
-    func openCodexInstallPage() {
-        NSWorkspace.shared.open(URL(string: "https://github.com/openai/codex")!)
+    func openAgentInstallPage(provider: LocalAgentProvider) {
+        switch provider {
+        case .codex:
+            NSWorkspace.shared.open(URL(string: "https://github.com/openai/codex")!)
+        case .claude:
+            NSWorkspace.shared.open(URL(string: "https://www.anthropic.com/claude-code")!)
+        }
     }
 
     func openProjectFolder(_ project: DiscoveredProjectCandidate) {
         NSWorkspace.shared.activateFileViewerSelecting([project.rootURL])
     }
 
-    func openCodexLoginHelp() {
-        NSWorkspace.shared.open(URL(string: "https://developers.openai.com/codex")!)
+    func openAgentLoginHelp(provider: LocalAgentProvider) {
+        switch provider {
+        case .codex:
+            NSWorkspace.shared.open(URL(string: "https://developers.openai.com/codex")!)
+        case .claude:
+            NSWorkspace.shared.open(URL(string: "https://docs.anthropic.com/en/docs/claude-code")!)
+        }
     }
 
     func insertGeneratedPlanIntoTimeline() {
@@ -339,9 +396,9 @@ final class LaunchKitAppModel {
 
     func discoverProjects() async {
         isDiscoveringProjects = true
+        defer { isDiscoveringProjects = false }
         let projects = await discoveryService.discover()
         discoveredProjects = projects
-        isDiscoveringProjects = false
         events.insert(WorkflowEvent(
             phase: .scanning,
             title: "Project discovery completed",
@@ -536,23 +593,31 @@ struct HomeView: View {
                     subtitle: "LaunchKit should discover local Apple projects automatically, let AI generate the release plan and assets, and ask for approval only when a step affects code, Apple state, public metadata, privacy, or revenue."
                 )
 
+                Picker("Local AI provider", selection: $model.selectedAIProvider) {
+                    ForEach(LocalAgentProvider.allCases) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 360)
+
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), spacing: 16)], spacing: 16) {
                     OnboardingStepCard(
                         number: "1",
-                        title: "Connect Codex",
-                        status: model.isCheckingCodex ? "Checking" : model.aiConnectionState.rawValue,
-                        bodyText: "LaunchKit uses ChatGPT-authenticated Codex through the local Codex CLI. It does not ask for provider API keys.",
-                        buttonTitle: codexButtonTitle,
+                        title: "Connect \(model.selectedAIProvider.displayName)",
+                        status: model.isCheckingAgent ? "Checking" : model.aiConnectionState.rawValue,
+                        bodyText: "LaunchKit uses local subscription auth through \(model.selectedAIProvider.displayName). It does not ask for provider API keys.",
+                        buttonTitle: agentButtonTitle(for: model.selectedAIProvider),
                         systemImage: "sparkles"
                     ) {
                         Task {
                             switch model.aiConnectionState {
                             case .missing:
-                                await model.installCodex()
+                                await model.installAgent(provider: model.selectedAIProvider)
                             case .connected:
-                                await model.refreshCodexStatus()
+                                await model.refreshAgentStatus(provider: model.selectedAIProvider)
                             default:
-                                await model.connectAI()
+                                await model.connectAI(provider: model.selectedAIProvider)
                             }
                         }
                     }
@@ -601,17 +666,17 @@ struct HomeView: View {
             .padding(32)
         }
         .task {
-            if model.codexAuthenticationState == nil {
-                await model.refreshCodexStatus()
+            if LocalAgentProvider.allCases.contains(where: { model.authenticationState(for: $0) == nil }) {
+                await model.refreshAllAgentStatuses()
             }
         }
     }
 
-    private var codexButtonTitle: String {
-        if model.isInstallingCodex { return "Installing..." }
-        if model.isLoggingIntoCodex { return "Opening Login..." }
-        switch model.aiConnectionState {
-        case .missing: return "Install Codex"
+    private func agentButtonTitle(for provider: LocalAgentProvider) -> String {
+        if model.isInstallingAgent { return "Installing..." }
+        if model.isLoggingIntoAgent { return "Opening Login..." }
+        switch model.connectionState(for: provider) {
+        case .missing: return "Install \(provider.displayName)"
         case .connected: return "Recheck"
         case .loginRequired, .failed, .notConnected: return "Open Login"
         case .checking: return "Checking..."
@@ -699,15 +764,8 @@ struct ConnectionSummary: View {
 
     var body: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 340), spacing: 16)], spacing: 16) {
-            StatusPanel(
-                title: "Codex Account",
-                status: model.aiConnectionState.rawValue,
-                detail: model.codexStatusMessage,
-                footnote: model.codexAuthenticationState?.executablePath ?? "Install path will appear after detection.",
-                actionTitle: "Device Login",
-                systemImage: "person.crop.circle.badge.checkmark"
-            ) {
-                Task { await model.connectAI(deviceAuth: true) }
+            ForEach(LocalAgentProvider.allCases) { provider in
+                AgentStatusPanel(model: model, provider: provider)
             }
 
             StatusPanel(
@@ -720,6 +778,46 @@ struct ConnectionSummary: View {
             ) {
                 Task { await model.connectApple() }
             }
+        }
+    }
+}
+
+struct AgentStatusPanel: View {
+    @Bindable var model: LaunchKitAppModel
+    let provider: LocalAgentProvider
+
+    var body: some View {
+        StatusPanel(
+            title: "\(provider.displayName) Account",
+            status: model.connectionState(for: provider).rawValue,
+            detail: model.statusMessage(for: provider),
+            footnote: model.authenticationState(for: provider)?.executablePath ?? "Install path will appear after detection.",
+            actionTitle: actionTitle,
+            systemImage: provider == .codex ? "person.crop.circle.badge.checkmark" : "person.crop.circle"
+        ) {
+            Task {
+                switch model.connectionState(for: provider) {
+                case .missing:
+                    await model.installAgent(provider: provider)
+                case .connected:
+                    await model.refreshAgentStatus(provider: provider)
+                default:
+                    await model.connectAI(provider: provider)
+                }
+            }
+        }
+    }
+
+    private var actionTitle: String {
+        if model.isInstallingAgent { return "Installing..." }
+        if model.isLoggingIntoAgent { return "Opening Login..." }
+        switch model.connectionState(for: provider) {
+        case .missing: return "Install"
+        case .connected: return "Recheck"
+        case .loginRequired, .failed, .notConnected: return "Open Login"
+        case .checking: return "Checking..."
+        case .installing: return "Installing..."
+        case .limited: return "Open Login"
         }
     }
 }
@@ -861,7 +959,7 @@ struct ReleasePlanView: View {
                     Button {
                         Task { await model.generateReleasePlan() }
                     } label: {
-                        Label(model.isGeneratingReleasePlan ? "Generating..." : "Generate With Codex", systemImage: "sparkles")
+                        Label(model.isGeneratingReleasePlan ? "Generating..." : "Generate With \(model.selectedAIProvider.displayName)", systemImage: "sparkles")
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.isGeneratingReleasePlan)
@@ -936,7 +1034,7 @@ struct ScreenshotGalleryView: View {
                 HeaderBlock(
                     eyebrow: "Public asset review",
                     title: "Screenshot Gallery",
-                    subtitle: "Codex generates screenshot concepts through the local CLI. LaunchKit renders reviewable drafts locally and keeps upload as an approval-gated public-facing action."
+                    subtitle: "\(model.selectedAIProvider.displayName) generates screenshot concepts through the local CLI. LaunchKit renders reviewable drafts locally and keeps upload as an approval-gated public-facing action."
                 )
 
                 HStack(spacing: 12) {
@@ -1026,7 +1124,7 @@ struct MetadataEditorView: View {
                 Button {
                     Task { await model.generateMetadataDraft() }
                 } label: {
-                    Label(model.isGeneratingMetadataDraft ? "Drafting..." : "Generate With Codex", systemImage: "sparkles")
+                    Label(model.isGeneratingMetadataDraft ? "Drafting..." : "Generate With \(model.selectedAIProvider.displayName)", systemImage: "sparkles")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(model.isGeneratingMetadataDraft)
@@ -1043,7 +1141,7 @@ struct MetadataEditorView: View {
                         rows: [
                             ("Subtitle", "AI-powered release agent for Apple developers"),
                             ("Keywords", "release, testflight, xcode, signing, screenshots"),
-                            ("Release Notes", model.generatedReleasePlan ?? "Generate a Codex release plan to seed release notes from scan evidence."),
+                            ("Release Notes", model.generatedReleasePlan ?? "Generate an AI release plan to seed release notes from scan evidence."),
                             ("Review Notes", "Provide reviewer credentials and explain gated functionality before submission.")
                         ]
                     )
@@ -1099,7 +1197,7 @@ struct PaymentsManagerView: View {
                 Button {
                     Task { await model.generateIAPDraft() }
                 } label: {
-                    Label(model.isGeneratingIAPDraft ? "Preparing..." : "Generate IAP Plan With Codex", systemImage: "sparkles")
+                    Label(model.isGeneratingIAPDraft ? "Preparing..." : "Generate IAP Plan With \(model.selectedAIProvider.displayName)", systemImage: "sparkles")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(model.isGeneratingIAPDraft)
@@ -1185,7 +1283,7 @@ struct SubmissionReviewView: View {
     private var submissionItems: [(String, String, String, String)] {
         [
             ("Project Scan", "waveform.path.ecg.rectangle", model.scanResult == nil ? "No selected project has been scanned." : "Scan evidence is attached.", model.scanResult == nil ? "Required" : "Ready"),
-            ("Codex Plan", "sparkles", model.generatedReleasePlan == nil ? "Generate or review the release plan." : "AI draft is available.", model.generatedReleasePlan == nil ? "Required" : "Ready"),
+            ("AI Plan", "sparkles", model.generatedReleasePlan == nil ? "Generate or review the release plan." : "AI draft is available.", model.generatedReleasePlan == nil ? "Required" : "Ready"),
             ("Screenshots", "photo.on.rectangle", model.generatedScreenshotDraft == nil ? "Generate and approve screenshot drafts." : "Screenshot draft is available for review.", model.generatedScreenshotDraft == nil ? "Review" : "Draft"),
             ("Apple Environment", "apple.logo", model.appleConnectionMessage, model.appleConnectionState.rawValue)
         ]
@@ -1200,17 +1298,19 @@ struct SettingsView: View {
             HeaderBlock(
                 eyebrow: "Local-first secrets",
                 title: "Settings & Secrets",
-                subtitle: "Codex authentication is owned by the local Codex CLI. Apple signing material, repository access, and advanced App Store Connect keys stay local by default."
+                subtitle: "Codex and Claude Code authentication are owned by their local CLIs. Apple signing material, repository access, and advanced App Store Connect keys stay local by default."
             )
-            StatusPanel(
-                title: "Codex CLI",
-                status: model.aiConnectionState.rawValue,
-                detail: model.codexStatusMessage,
-                footnote: model.codexAuthenticationState?.version ?? "Version unavailable",
-                actionTitle: "Check Status",
-                systemImage: "terminal"
-            ) {
-                Task { await model.refreshCodexStatus() }
+            ForEach(LocalAgentProvider.allCases) { provider in
+                StatusPanel(
+                    title: "\(provider.displayName) CLI",
+                    status: model.connectionState(for: provider).rawValue,
+                    detail: model.statusMessage(for: provider),
+                    footnote: model.authenticationState(for: provider)?.version ?? "Version unavailable",
+                    actionTitle: "Check Status",
+                    systemImage: "terminal"
+                ) {
+                    Task { await model.refreshAgentStatus(provider: provider) }
+                }
             }
             Spacer()
         }

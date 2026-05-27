@@ -1,27 +1,115 @@
 import Foundation
 import LaunchKitCore
 
-public enum CodexCLIError: Error, LocalizedError, Sendable {
-    case missingExecutable
-    case commandFailed(Int32, String)
-    case timedOut(String)
-    case emptyOutput
+public enum LocalAgentProvider: String, Codable, CaseIterable, Sendable, Identifiable {
+    case codex
+    case claude
 
-    public var errorDescription: String? {
+    public var id: String { rawValue }
+
+    public var displayName: String {
         switch self {
-        case .missingExecutable:
-            return "Codex CLI is not installed."
-        case let .commandFailed(status, output):
-            return "Codex command failed with exit code \(status): \(output)"
-        case let .timedOut(command):
-            return "Codex command timed out: \(command)"
-        case .emptyOutput:
-            return "Codex did not return an output message."
+        case .codex: return "Codex"
+        case .claude: return "Claude Code"
+        }
+    }
+
+    public var subscriptionLabel: String {
+        switch self {
+        case .codex: return "ChatGPT-authenticated Codex"
+        case .claude: return "Claude.ai-authenticated Claude Code"
+        }
+    }
+
+    public var executableName: String {
+        switch self {
+        case .codex: return "codex"
+        case .claude: return "claude"
+        }
+    }
+
+    public var npmPackageName: String {
+        switch self {
+        case .codex: return "@openai/codex"
+        case .claude: return "@anthropic-ai/claude-code"
+        }
+    }
+
+    var defaultExecutablePaths: [String] {
+        switch self {
+        case .codex:
+            return [
+                "/Applications/Codex.app/Contents/Resources/codex",
+                "/opt/homebrew/bin/codex",
+                "/usr/local/bin/codex",
+                "/usr/bin/codex"
+            ]
+        case .claude:
+            return [
+                "/opt/homebrew/bin/claude",
+                "/usr/local/bin/claude",
+                "/usr/bin/claude"
+            ]
+        }
+    }
+
+    var versionArguments: [String] { ["--version"] }
+
+    var statusArguments: [String] {
+        switch self {
+        case .codex: return ["login", "status"]
+        case .claude: return ["auth", "status"]
+        }
+    }
+
+    func loginArguments(mode: LocalAgentLoginMode) -> [String] {
+        switch (self, mode) {
+        case (.codex, .deviceAuth):
+            return ["login", "--device-auth"]
+        case (.codex, _):
+            return ["login"]
+        case let (.claude, .email(email)):
+            return ["auth", "login", "--email", email]
+        case (.claude, .sso):
+            return ["auth", "login", "--sso"]
+        case (.claude, .console):
+            return ["auth", "login", "--console"]
+        case (.claude, _):
+            return ["auth", "login"]
         }
     }
 }
 
-public struct CodexAuthenticationState: Codable, Hashable, Sendable {
+public enum LocalAgentLoginMode: Hashable, Sendable {
+    case browser
+    case deviceAuth
+    case email(String)
+    case sso
+    case console
+}
+
+public enum LocalAgentBridgeError: Error, LocalizedError, Sendable {
+    case missingExecutable(LocalAgentProvider)
+    case commandFailed(LocalAgentProvider, Int32, String)
+    case timedOut(LocalAgentProvider, String)
+    case emptyOutput(LocalAgentProvider)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .missingExecutable(provider):
+            return "\(provider.displayName) CLI is not installed."
+        case let .commandFailed(provider, status, output):
+            return "\(provider.displayName) command failed with exit code \(status): \(output)"
+        case let .timedOut(provider, command):
+            return "\(provider.displayName) command timed out: \(command)"
+        case let .emptyOutput(provider):
+            return "\(provider.displayName) did not return output."
+        }
+    }
+}
+
+public struct LocalAgentAuthenticationState: Codable, Hashable, Sendable {
+    public var provider: LocalAgentProvider
     public var isInstalled: Bool
     public var isLoggedIn: Bool
     public var executablePath: String?
@@ -29,12 +117,14 @@ public struct CodexAuthenticationState: Codable, Hashable, Sendable {
     public var statusText: String
 
     public init(
+        provider: LocalAgentProvider,
         isInstalled: Bool,
         isLoggedIn: Bool,
         executablePath: String?,
         version: String?,
         statusText: String
     ) {
+        self.provider = provider
         self.isInstalled = isInstalled
         self.isLoggedIn = isLoggedIn
         self.executablePath = executablePath
@@ -43,7 +133,7 @@ public struct CodexAuthenticationState: Codable, Hashable, Sendable {
     }
 }
 
-public struct CodexCommandResult: Codable, Hashable, Sendable {
+public struct LocalAgentCommandResult: Codable, Hashable, Sendable {
     public var exitCode: Int32
     public var standardOutput: String
     public var standardError: String
@@ -62,124 +152,132 @@ public struct CodexCommandResult: Codable, Hashable, Sendable {
     }
 }
 
-public actor CodexCLIClient {
-    private let explicitExecutablePath: String?
+public actor LocalAgentBridge {
+    private let explicitExecutablePaths: [LocalAgentProvider: String]
     private let fileManager: FileManager
 
-    public init(executablePath: String? = nil, fileManager: FileManager = .default) {
-        self.explicitExecutablePath = executablePath
+    public init(
+        explicitExecutablePaths: [LocalAgentProvider: String] = [:],
+        fileManager: FileManager = .default
+    ) {
+        self.explicitExecutablePaths = explicitExecutablePaths
         self.fileManager = fileManager
     }
 
-    public func probeAuthentication() async -> CodexAuthenticationState {
-        guard let codex = resolveCodexExecutable() else {
-            return CodexAuthenticationState(
+    public func probeAuthentication(provider: LocalAgentProvider) async -> LocalAgentAuthenticationState {
+        guard let executablePath = resolveExecutable(for: provider) else {
+            return LocalAgentAuthenticationState(
+                provider: provider,
                 isInstalled: false,
                 isLoggedIn: false,
                 executablePath: nil,
                 version: nil,
-                statusText: "Codex CLI is not installed."
+                statusText: "\(provider.displayName) CLI is not installed."
             )
         }
 
         let versionResult = await runProcessOrFailure(
-            executablePath: codex,
-            arguments: ["--version"],
+            provider: provider,
+            executablePath: executablePath,
+            arguments: provider.versionArguments,
             currentDirectoryURL: nil,
             timeout: 20
         )
         let statusResult = await runProcessOrFailure(
-            executablePath: codex,
-            arguments: ["login", "status"],
+            provider: provider,
+            executablePath: executablePath,
+            arguments: provider.statusArguments,
             currentDirectoryURL: nil,
             timeout: 20
         )
 
         let version = versionResult.exitCode == 0 ? versionResult.combinedOutput : nil
-        return CodexAuthenticationState(
+        return LocalAgentAuthenticationState(
+            provider: provider,
             isInstalled: true,
             isLoggedIn: statusResult.exitCode == 0,
-            executablePath: codex,
+            executablePath: executablePath,
             version: version?.isEmpty == false ? version : nil,
-            statusText: statusResult.combinedOutput.isEmpty ? "Codex login status unavailable." : statusResult.combinedOutput
+            statusText: statusResult.combinedOutput.isEmpty
+                ? "\(provider.displayName) auth status unavailable."
+                : statusResult.combinedOutput
         )
     }
 
-    public func installWithNPM() async throws -> CodexAuthenticationState {
+    public func installWithNPM(provider: LocalAgentProvider) async throws -> LocalAgentAuthenticationState {
         let npm = resolveExecutable(named: "npm", candidates: [
             "/opt/homebrew/bin/npm",
             "/usr/local/bin/npm",
             "/usr/bin/npm"
         ])
         guard let npm else {
-            throw CodexCLIError.commandFailed(-1, "npm is not installed.")
+            throw LocalAgentBridgeError.commandFailed(provider, -1, "npm is not installed.")
         }
 
         let result = try await runProcess(
+            provider: provider,
             executablePath: npm,
-            arguments: ["install", "-g", "@openai/codex"],
+            arguments: ["install", "-g", provider.npmPackageName],
             currentDirectoryURL: nil,
             timeout: 600
         )
         guard result.exitCode == 0 else {
-            throw CodexCLIError.commandFailed(result.exitCode, result.combinedOutput)
+            throw LocalAgentBridgeError.commandFailed(provider, result.exitCode, result.combinedOutput)
         }
-        return await probeAuthentication()
+        return await probeAuthentication(provider: provider)
     }
 
-    public func login(deviceAuth: Bool = false) async throws -> CodexAuthenticationState {
-        guard let codex = resolveCodexExecutable() else {
-            throw CodexCLIError.missingExecutable
+    public func login(
+        provider: LocalAgentProvider,
+        mode: LocalAgentLoginMode = .browser
+    ) async throws -> LocalAgentAuthenticationState {
+        guard let executablePath = resolveExecutable(for: provider) else {
+            throw LocalAgentBridgeError.missingExecutable(provider)
         }
 
-        let arguments = deviceAuth ? ["login", "--device-auth"] : ["login"]
         let result = try await runProcess(
-            executablePath: codex,
-            arguments: arguments,
+            provider: provider,
+            executablePath: executablePath,
+            arguments: provider.loginArguments(mode: mode),
             currentDirectoryURL: nil,
             timeout: 900
         )
         guard result.exitCode == 0 else {
-            throw CodexCLIError.commandFailed(result.exitCode, result.combinedOutput)
+            throw LocalAgentBridgeError.commandFailed(provider, result.exitCode, result.combinedOutput)
         }
-        return await probeAuthentication()
+        return await probeAuthentication(provider: provider)
     }
 
     public func complete(
+        provider: LocalAgentProvider,
         prompt: String,
         workingDirectoryURL: URL?,
         modelOverride: String? = nil,
         timeout: TimeInterval = 900
     ) async throws -> String {
-        guard let codex = resolveCodexExecutable() else {
-            throw CodexCLIError.missingExecutable
+        guard let executablePath = resolveExecutable(for: provider) else {
+            throw LocalAgentBridgeError.missingExecutable(provider)
         }
 
         let outputURL = fileManager.temporaryDirectory
-            .appending(path: "launchkit-codex-\(UUID().uuidString).txt")
-        var arguments = [
-            "exec",
-            "-c", "approval_policy=never",
-            "--sandbox", "read-only",
-            "--skip-git-repo-check",
-            "--output-last-message", outputURL.path
-        ]
-        if let modelOverride, !modelOverride.isEmpty {
-            arguments += ["--model", modelOverride]
-        }
-        if let workingDirectoryURL {
-            arguments += ["-C", workingDirectoryURL.path]
-        }
-        arguments.append(prompt)
+            .appending(path: "launchkit-\(provider.rawValue)-\(UUID().uuidString).txt")
+        let arguments = runArguments(
+            provider: provider,
+            prompt: prompt,
+            outputURL: outputURL,
+            workingDirectoryURL: workingDirectoryURL,
+            modelOverride: modelOverride
+        )
 
         let result = try await runProcess(
-            executablePath: codex,
+            provider: provider,
+            executablePath: executablePath,
             arguments: arguments,
             currentDirectoryURL: workingDirectoryURL,
             timeout: timeout
         )
         guard result.exitCode == 0 else {
-            throw CodexCLIError.commandFailed(result.exitCode, result.combinedOutput)
+            throw LocalAgentBridgeError.commandFailed(provider, result.exitCode, result.combinedOutput)
         }
 
         let fileOutput = (try? String(contentsOf: outputURL, encoding: .utf8))?
@@ -189,11 +287,11 @@ public actor CodexCLIClient {
         let output = fileOutput?.isEmpty == false
             ? fileOutput!
             : result.combinedOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !output.isEmpty else { throw CodexCLIError.emptyOutput }
+        guard !output.isEmpty else { throw LocalAgentBridgeError.emptyOutput(provider) }
         return output
     }
 
-    public nonisolated func releasePlanPrompt(scan: ProjectScanResult?) -> String {
+    public nonisolated func releasePlanPrompt(provider: LocalAgentProvider, scan: ProjectScanResult?) -> String {
         var facts = "No project scan is selected yet. Generate the next release setup plan from first principles."
         if let scan {
             facts = """
@@ -208,7 +306,7 @@ public actor CodexCLIClient {
         }
 
         return """
-        You are LaunchKit's ChatGPT-authenticated Codex release agent.
+        You are LaunchKit's \(provider.subscriptionLabel) release agent.
         Produce a concise Apple app release plan in plain English.
         Automate deterministic local tasks.
         Mark code mutation, signing, privacy, revenue, public metadata, screenshots, and App Store submission as approval-gated.
@@ -220,11 +318,11 @@ public actor CodexCLIClient {
         """
     }
 
-    public nonisolated func screenshotDraftPrompt(scan: ProjectScanResult?) -> String {
+    public nonisolated func screenshotDraftPrompt(provider: LocalAgentProvider, scan: ProjectScanResult?) -> String {
         let appDescription = scan.map { "\($0.projectType.rawValue) app with \($0.capabilities.count) detected Apple capabilities" }
             ?? "Apple app preparing for App Store release"
         return """
-        You are LaunchKit's ChatGPT-authenticated Codex asset director.
+        You are LaunchKit's \(provider.subscriptionLabel) asset director.
         Generate one premium App Store screenshot concept for this app: \(appDescription).
         Return three short labeled lines only:
         Title: ...
@@ -234,7 +332,11 @@ public actor CodexCLIClient {
         """
     }
 
-    public nonisolated func metadataDraftPrompt(scan: ProjectScanResult?, releasePlan: String?) -> String {
+    public nonisolated func metadataDraftPrompt(
+        provider: LocalAgentProvider,
+        scan: ProjectScanResult?,
+        releasePlan: String?
+    ) -> String {
         let projectFacts = scan.map {
             """
             Project type: \($0.projectType.rawValue)
@@ -243,7 +345,7 @@ public actor CodexCLIClient {
             """
         } ?? "No scan selected."
         return """
-        You are LaunchKit's ChatGPT-authenticated Codex metadata assistant.
+        You are LaunchKit's \(provider.subscriptionLabel) metadata assistant.
         Draft App Store metadata from local evidence only.
         Return concise sections with labels: Subtitle, Description, Keywords, Release Notes, Review Notes, Privacy Questions.
         Mark assumptions clearly. Do not invent unsupported claims, pricing, awards, or compliance promises.
@@ -256,10 +358,10 @@ public actor CodexCLIClient {
         """
     }
 
-    public nonisolated func iapDraftPrompt(scan: ProjectScanResult?) -> String {
+    public nonisolated func iapDraftPrompt(provider: LocalAgentProvider, scan: ProjectScanResult?) -> String {
         let detectedStoreKit = scan?.capabilities.contains(.inAppPurchase) == true
         return """
-        You are LaunchKit's ChatGPT-authenticated Codex payments planner.
+        You are LaunchKit's \(provider.subscriptionLabel) payments planner.
         Draft a local StoreKit/IAP setup plan for an Apple app.
         Return concise sections with labels: Product Candidates, Subscription Groups, StoreKit Config, Sandbox Testing, Approval Gates.
         Do not choose live prices. Do not propose live App Store Connect mutations without explicit approval.
@@ -267,16 +369,44 @@ public actor CodexCLIClient {
         """
     }
 
-    private func resolveCodexExecutable() -> String? {
-        if let explicitExecutablePath, fileManager.isExecutableFile(atPath: explicitExecutablePath) {
-            return explicitExecutablePath
+    private func runArguments(
+        provider: LocalAgentProvider,
+        prompt: String,
+        outputURL: URL,
+        workingDirectoryURL: URL?,
+        modelOverride: String?
+    ) -> [String] {
+        switch provider {
+        case .codex:
+            var arguments = [
+                "exec",
+                "-c", "approval_policy=never",
+                "--sandbox", "read-only",
+                "--skip-git-repo-check",
+                "--output-last-message", outputURL.path
+            ]
+            if let modelOverride, !modelOverride.isEmpty {
+                arguments += ["--model", modelOverride]
+            }
+            if let workingDirectoryURL {
+                arguments += ["-C", workingDirectoryURL.path]
+            }
+            arguments.append(prompt)
+            return arguments
+        case .claude:
+            return ["-p", prompt]
         }
-        return resolveExecutable(named: "codex", candidates: [
-            "/Applications/Codex.app/Contents/Resources/codex",
-            "/opt/homebrew/bin/codex",
-            "/usr/local/bin/codex",
-            "/usr/bin/codex"
-        ])
+    }
+
+    private func resolveExecutable(for provider: LocalAgentProvider) -> String? {
+        if let explicitPath = explicitExecutablePaths[provider],
+           fileManager.isExecutableFile(atPath: explicitPath) {
+            return explicitPath
+        }
+        return resolveExecutable(
+            named: provider.executableName,
+            candidates: provider.defaultExecutablePaths
+        )
     }
 
     private func resolveExecutable(named name: String, candidates: [String]) -> String? {
@@ -294,35 +424,38 @@ public actor CodexCLIClient {
     }
 
     private func runProcessOrFailure(
+        provider: LocalAgentProvider,
         executablePath: String,
         arguments: [String],
         currentDirectoryURL: URL?,
         timeout: TimeInterval
-    ) async -> CodexCommandResult {
+    ) async -> LocalAgentCommandResult {
         do {
             return try await runProcess(
+                provider: provider,
                 executablePath: executablePath,
                 arguments: arguments,
                 currentDirectoryURL: currentDirectoryURL,
                 timeout: timeout
             )
         } catch {
-            return CodexCommandResult(exitCode: -1, standardOutput: "", standardError: error.localizedDescription)
+            return LocalAgentCommandResult(exitCode: -1, standardOutput: "", standardError: error.localizedDescription)
         }
     }
 
     private func runProcess(
+        provider: LocalAgentProvider,
         executablePath: String,
         arguments: [String],
         currentDirectoryURL: URL?,
         timeout: TimeInterval
-    ) async throws -> CodexCommandResult {
+    ) async throws -> LocalAgentCommandResult {
         try await Task.detached(priority: .utility) {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executablePath)
             process.arguments = arguments
             process.currentDirectoryURL = currentDirectoryURL
-            process.environment = environmentWithDeveloperPaths()
+            process.environment = environmentWithLocalAgentPaths()
 
             let stdout = Pipe()
             let stderr = Pipe()
@@ -336,12 +469,12 @@ public actor CodexCLIClient {
             }
             if process.isRunning {
                 process.terminate()
-                throw CodexCLIError.timedOut(([executablePath] + arguments).joined(separator: " "))
+                throw LocalAgentBridgeError.timedOut(provider, ([executablePath] + arguments).joined(separator: " "))
             }
 
             let stdoutText = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             let stderrText = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            return CodexCommandResult(
+            return LocalAgentCommandResult(
                 exitCode: process.terminationStatus,
                 standardOutput: stdoutText,
                 standardError: stderrText
@@ -350,7 +483,7 @@ public actor CodexCLIClient {
     }
 }
 
-private func environmentWithDeveloperPaths() -> [String: String] {
+private func environmentWithLocalAgentPaths() -> [String: String] {
     var environment = ProcessInfo.processInfo.environment
     let launchKitPath = "/Applications/Codex.app/Contents/Resources:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     let existingPath = environment["PATH"] ?? ""
