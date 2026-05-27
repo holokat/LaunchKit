@@ -38,6 +38,7 @@ final class LaunchKitAppModel {
     var plannedActions: [LaunchKitAction] = LaunchKitSampleData.actions
     var events: [WorkflowEvent] = LaunchKitSampleData.events
     var discoveredProjects: [DiscoveredProjectCandidate] = []
+    var releaseKits: [String: ReleaseKitState] = [:]
     var isDiscoveringProjects = false
     var selectedAIProvider: LocalAgentProvider = .codex {
         didSet { aiConnectionState = connectionState(for: selectedAIProvider) }
@@ -89,6 +90,10 @@ final class LaunchKitAppModel {
 
     var selectedProjectName: String {
         selectedProject?.name ?? "No app selected"
+    }
+
+    func releaseKit(for project: DiscoveredProjectCandidate) -> ReleaseKitState {
+        releaseKits[project.id] ?? ReleaseKitState()
     }
 
     var riskDisplayStatus: String {
@@ -340,59 +345,78 @@ final class LaunchKitAppModel {
 
     func selectProject(_ project: DiscoveredProjectCandidate) {
         selectedProject = project
-        if scanResult?.rootURL != project.rootURL {
-            scanResult = nil
-            findings = []
-            resetReleaseKit()
-        }
     }
 
     func generateReleaseKit() async {
         guard let project = selectedProject else { return }
+        await generateReleaseKit(for: project)
+    }
+
+    func generateReleaseKit(for project: DiscoveredProjectCandidate) async {
         guard await ensureSelectedAgentConnected(phase: .planning, taskName: "generate the release kit") else { return }
 
-        resetReleaseKit()
-        hasStartedReleaseKit = true
-        isGeneratingReleaseKit = true
+        let projectID = project.id
+        let provider = selectedAIProvider
+        resetReleaseKit(for: projectID)
+        updateReleaseKit(for: projectID) { kit in
+            kit.hasStartedReleaseKit = true
+            kit.isGeneratingReleaseKit = true
+            kit.releaseKitStatus = "Starting"
+        }
         defer {
-            isGeneratingReleaseKit = false
-            isGeneratingReleasePlan = false
-            isGeneratingMetadataDraft = false
-            isGeneratingScreenshotDraft = false
-            isGeneratingIAPDraft = false
+            updateReleaseKit(for: projectID) { kit in
+                kit.isGeneratingReleaseKit = false
+                kit.isGeneratingReleasePlan = false
+                kit.isGeneratingMetadataDraft = false
+                kit.isGeneratingScreenshotDraft = false
+                kit.isGeneratingIAPDraft = false
+            }
         }
 
         do {
-            releaseKitStatus = "Reading \(project.name)"
-            riskStatus = .generating
+            updateReleaseKit(for: projectID) { kit in
+                kit.releaseKitStatus = "Reading \(project.name)"
+                kit.riskStatus = .generating
+            }
             let result = try await scanner.scan(rootURL: project.rootURL)
-            scanResult = result
-            findings = result.findings
-            riskStatus = .ready
+            updateReleaseKit(for: projectID) { kit in
+                kit.scanResult = result
+                kit.findings = result.findings
+                kit.riskStatus = .ready
+                kit.releaseKitStatus = "Writing release plan"
+                kit.releasePlanStatus = .generating
+                kit.isGeneratingReleasePlan = true
+            }
 
-            releaseKitStatus = "Writing release plan"
-            releasePlanStatus = .generating
-            isGeneratingReleasePlan = true
-            generatedReleasePlan = try await localAgentBridge.complete(
-                provider: selectedAIProvider,
-                prompt: localAgentBridge.releasePlanPrompt(provider: selectedAIProvider, scan: result),
+            let releasePlan = try await localAgentBridge.complete(
+                provider: provider,
+                prompt: localAgentBridge.releasePlanPrompt(provider: provider, scan: result),
                 workingDirectoryURL: result.rootURL
             )
-            releasePlanStatus = .ready
-            isGeneratingReleasePlan = false
+            updateReleaseKit(for: projectID) { kit in
+                kit.generatedReleasePlan = releasePlan
+                kit.releasePlanStatus = .ready
+                kit.isGeneratingReleasePlan = false
+                kit.metadataStatus = .generating
+                kit.screenshotStatus = .generating
+                kit.iapStatus = .generating
+                kit.appleToolsStatus = .generating
+                kit.isGeneratingMetadataDraft = true
+                kit.isGeneratingScreenshotDraft = true
+                kit.isGeneratingIAPDraft = true
+                kit.releaseKitStatus = "Generating review sections"
+            }
 
-            metadataStatus = .generating
-            screenshotStatus = .generating
-            iapStatus = .generating
-            appleToolsStatus = .generating
-            isGeneratingMetadataDraft = true
-            isGeneratingScreenshotDraft = true
-            isGeneratingIAPDraft = true
-            releaseKitStatus = "Generating review sections"
+            await generateRemainingReleaseKitSections(
+                scan: result,
+                projectID: projectID,
+                provider: provider,
+                releasePlan: releasePlan
+            )
 
-            await generateRemainingReleaseKitSections(scan: result)
-
-            releaseKitStatus = "Ready for review"
+            updateReleaseKit(for: projectID) { kit in
+                kit.releaseKitStatus = "Ready for review"
+            }
             events.insert(WorkflowEvent(
                 phase: .planning,
                 title: "Release kit generated",
@@ -400,9 +424,11 @@ final class LaunchKitAppModel {
                 risk: .informational
             ), at: 0)
         } catch {
-            releaseKitStatus = "Stopped"
-            if riskStatus == .generating { riskStatus = .failed }
-            if releasePlanStatus == .generating { releasePlanStatus = .failed }
+            updateReleaseKit(for: projectID) { kit in
+                kit.releaseKitStatus = "Stopped"
+                if kit.riskStatus == .generating { kit.riskStatus = .failed }
+                if kit.releasePlanStatus == .generating { kit.releasePlanStatus = .failed }
+            }
             events.insert(WorkflowEvent(
                 phase: .planning,
                 title: "Release kit generation failed",
@@ -412,24 +438,22 @@ final class LaunchKitAppModel {
         }
     }
 
-    private func resetReleaseKit() {
-        generatedReleasePlan = nil
-        generatedScreenshotDraft = nil
-        generatedMetadataDraft = nil
-        generatedIAPDraft = nil
-        hasStartedReleaseKit = false
-        releaseKitStatus = "Ready"
-        releasePlanStatus = .pending
-        metadataStatus = .pending
-        screenshotStatus = .pending
-        iapStatus = .pending
-        riskStatus = .pending
-        appleToolsStatus = .pending
+    private func updateReleaseKit(for projectID: String, _ update: (inout ReleaseKitState) -> Void) {
+        var kit = releaseKits[projectID] ?? ReleaseKitState()
+        update(&kit)
+        releaseKits[projectID] = kit
     }
 
-    private func generateRemainingReleaseKitSections(scan: ProjectScanResult) async {
-        let provider = selectedAIProvider
-        let releasePlan = generatedReleasePlan
+    private func resetReleaseKit(for projectID: String) {
+        releaseKits[projectID] = ReleaseKitState()
+    }
+
+    private func generateRemainingReleaseKitSections(
+        scan: ProjectScanResult,
+        projectID: String,
+        provider: LocalAgentProvider,
+        releasePlan: String
+    ) async {
         await withTaskGroup(of: ReleaseKitGeneratedSection.self) { group in
             group.addTask { [localAgentBridge] in
                 do {
@@ -480,49 +504,59 @@ final class LaunchKitAppModel {
             }
 
             for await section in group {
-                applyGeneratedSection(section)
+                applyGeneratedSection(section, projectID: projectID)
             }
         }
     }
 
-    private func applyGeneratedSection(_ section: ReleaseKitGeneratedSection) {
+    private func applyGeneratedSection(_ section: ReleaseKitGeneratedSection, projectID: String) {
         switch section {
         case let .metadata(output):
-            generatedMetadataDraft = output
-            metadataStatus = .ready
-            isGeneratingMetadataDraft = false
-            releaseKitStatus = "Metadata ready"
-        case let .screenshots(output):
-            generatedScreenshotDraft = GeneratedScreenshotDraft(output: output)
-            screenshotStatus = .review
-            isGeneratingScreenshotDraft = false
-            releaseKitStatus = "Screenshot draft ready"
-        case let .iap(output):
-            generatedIAPDraft = output
-            iapStatus = .review
-            isGeneratingIAPDraft = false
-            releaseKitStatus = "Purchases ready"
-        case let .appleTools(environment):
-            appleEnvironment = environment
-            appleConnectionState = environment.isUsable ? (environment.diagnostics.isEmpty ? .connected : .limited) : .failed
-            appleConnectionMessage = appleSummary(for: environment)
-            appleToolsStatus = .ready
-            releaseKitStatus = "Apple tools checked"
-        case let .failed(section, message):
-            switch section {
-            case .metadata:
-                metadataStatus = .failed
-                isGeneratingMetadataDraft = false
-            case .screenshots:
-                screenshotStatus = .failed
-                isGeneratingScreenshotDraft = false
-            case .iap:
-                iapStatus = .failed
-                isGeneratingIAPDraft = false
-            case .appleTools:
-                appleToolsStatus = .failed
+            updateReleaseKit(for: projectID) { kit in
+                kit.generatedMetadataDraft = output
+                kit.metadataStatus = .ready
+                kit.isGeneratingMetadataDraft = false
+                kit.releaseKitStatus = "Metadata ready"
             }
-            releaseKitStatus = "\(section.title) failed"
+        case let .screenshots(output):
+            updateReleaseKit(for: projectID) { kit in
+                kit.generatedScreenshotDraft = GeneratedScreenshotDraft(output: output)
+                kit.screenshotStatus = .review
+                kit.isGeneratingScreenshotDraft = false
+                kit.releaseKitStatus = "Screenshot draft ready"
+            }
+        case let .iap(output):
+            updateReleaseKit(for: projectID) { kit in
+                kit.generatedIAPDraft = output
+                kit.iapStatus = .review
+                kit.isGeneratingIAPDraft = false
+                kit.releaseKitStatus = "Purchases ready"
+            }
+        case let .appleTools(environment):
+            updateReleaseKit(for: projectID) { kit in
+                kit.appleEnvironment = environment
+                kit.appleConnectionState = environment.isUsable ? (environment.diagnostics.isEmpty ? .connected : .limited) : .failed
+                kit.appleConnectionMessage = appleSummary(for: environment)
+                kit.appleToolsStatus = .ready
+                kit.releaseKitStatus = "Apple tools checked"
+            }
+        case let .failed(section, message):
+            updateReleaseKit(for: projectID) { kit in
+                switch section {
+                case .metadata:
+                    kit.metadataStatus = .failed
+                    kit.isGeneratingMetadataDraft = false
+                case .screenshots:
+                    kit.screenshotStatus = .failed
+                    kit.isGeneratingScreenshotDraft = false
+                case .iap:
+                    kit.iapStatus = .failed
+                    kit.isGeneratingIAPDraft = false
+                case .appleTools:
+                    kit.appleToolsStatus = .failed
+                }
+                kit.releaseKitStatus = "\(section.title) failed"
+            }
             events.insert(WorkflowEvent(
                 phase: section.phase,
                 title: "\(section.title) failed",
@@ -700,6 +734,49 @@ enum ReleaseKitSectionStatus: String {
     case ready = "Ready"
     case review = "Review"
     case failed = "Failed"
+}
+
+struct ReleaseKitState {
+    var scanResult: ProjectScanResult?
+    var findings: [DiagnosticFinding] = []
+    var generatedReleasePlan: String?
+    var generatedScreenshotDraft: GeneratedScreenshotDraft?
+    var generatedMetadataDraft: String?
+    var generatedIAPDraft: String?
+    var isGeneratingReleasePlan = false
+    var isGeneratingScreenshotDraft = false
+    var isGeneratingMetadataDraft = false
+    var isGeneratingIAPDraft = false
+    var isGeneratingReleaseKit = false
+    var hasStartedReleaseKit = false
+    var releaseKitStatus = "Ready"
+    var releasePlanStatus: ReleaseKitSectionStatus = .pending
+    var metadataStatus: ReleaseKitSectionStatus = .pending
+    var screenshotStatus: ReleaseKitSectionStatus = .pending
+    var iapStatus: ReleaseKitSectionStatus = .pending
+    var riskStatus: ReleaseKitSectionStatus = .pending
+    var appleToolsStatus: ReleaseKitSectionStatus = .pending
+    var appleEnvironment: AppleDeveloperEnvironment?
+    var appleConnectionState: ConnectionState = .notConnected
+    var appleConnectionMessage = "Apple developer environment has not been checked yet."
+
+    var riskDisplayStatus: String {
+        switch riskStatus {
+        case .ready:
+            findings.isEmpty ? "Clear" : "\(findings.count)"
+        default:
+            riskStatus.rawValue
+        }
+    }
+
+    var appleToolsDisplayStatus: String {
+        switch appleToolsStatus {
+        case .ready:
+            appleConnectionState.rawValue
+        default:
+            appleToolsStatus.rawValue
+        }
+    }
 }
 
 enum ReleaseKitGeneratedSection: Sendable {
@@ -921,6 +998,10 @@ struct AppListPane: View {
                         .scaleEffect(0.65)
                 }
             }
+            Text("Switch apps anytime. Each app keeps its own generated kit and running progress.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             if model.discoveredProjects.isEmpty {
                 ContentUnavailableView(
@@ -935,6 +1016,7 @@ struct AppListPane: View {
                         ForEach(model.discoveredProjects) { project in
                             AppListRow(
                                 project: project,
+                                kit: model.releaseKit(for: project),
                                 isSelected: model.selectedProject?.id == project.id
                             ) {
                                 model.selectProject(project)
@@ -1009,6 +1091,7 @@ struct LoginRequiredPanel: View {
 
 struct AppListRow: View {
     let project: DiscoveredProjectCandidate
+    let kit: ReleaseKitState
     let isSelected: Bool
     let action: () -> Void
 
@@ -1029,6 +1112,14 @@ struct AppListRow: View {
                         .lineLimit(1)
                 }
                 Spacer()
+                if let statusText {
+                    Text(statusText)
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(statusTint.opacity(0.14), in: Capsule())
+                        .foregroundStyle(statusTint)
+                }
             }
             .padding(10)
             .contentShape(Rectangle())
@@ -1044,6 +1135,20 @@ struct AppListRow: View {
         default: "app"
         }
     }
+
+    private var statusText: String? {
+        if kit.isGeneratingReleaseKit {
+            return "Generating"
+        }
+        if kit.hasStartedReleaseKit {
+            return "Ready"
+        }
+        return nil
+    }
+
+    private var statusTint: Color {
+        kit.isGeneratingReleaseKit ? .accentColor : .secondary
+    }
 }
 
 struct ReleaseKitPane: View {
@@ -1053,8 +1158,9 @@ struct ReleaseKitPane: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 if let project = model.selectedProject {
-                    SelectedAppHeader(model: model, project: project)
-                    ReleaseKitReview(model: model)
+                    let kit = model.releaseKit(for: project)
+                    SelectedAppHeader(model: model, project: project, kit: kit)
+                    ReleaseKitReview(model: model, project: project, kit: kit)
                 } else {
                     EmptyAppSelectionView()
                 }
@@ -1080,6 +1186,7 @@ struct EmptyAppSelectionView: View {
 struct SelectedAppHeader: View {
     @Bindable var model: LaunchKitAppModel
     let project: DiscoveredProjectCandidate
+    let kit: ReleaseKitState
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -1101,14 +1208,14 @@ struct SelectedAppHeader: View {
             }
 
             Button {
-                Task { await model.generateReleaseKit() }
+                Task { await model.generateReleaseKit(for: project) }
             } label: {
-                Label(primaryActionTitle, systemImage: model.isGeneratingReleaseKit ? "sparkles" : "wand.and.sparkles")
+                Label(primaryActionTitle, systemImage: kit.isGeneratingReleaseKit ? "sparkles" : "wand.and.sparkles")
                     .frame(minWidth: 220)
             }
             .controlSize(.large)
             .buttonStyle(.borderedProminent)
-            .disabled(!model.isAIReady || model.isGeneratingReleaseKit)
+            .disabled(!model.isAIReady || kit.isGeneratingReleaseKit)
 
             if !model.isAIReady {
                 Text("Sign in with Codex or Claude Code first.")
@@ -1119,24 +1226,26 @@ struct SelectedAppHeader: View {
     }
 
     private var primaryActionTitle: String {
-        model.isGeneratingReleaseKit ? model.releaseKitStatus : "Generate Release Kit"
+        kit.isGeneratingReleaseKit ? kit.releaseKitStatus : "Generate Release Kit"
     }
 }
 
 struct ReleaseKitReview: View {
     @Bindable var model: LaunchKitAppModel
+    let project: DiscoveredProjectCandidate
+    let kit: ReleaseKitState
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            if model.isGeneratingReleaseKit {
-                ProgressPanel(status: model.releaseKitStatus)
+            if kit.isGeneratingReleaseKit {
+                ProgressPanel(status: kit.releaseKitStatus)
             }
 
-            if !model.hasStartedReleaseKit {
+            if !kit.hasStartedReleaseKit {
                 FirstRunPanel()
             } else {
-                AppStoreReviewList(model: model)
-                NextActionPanel(model: model)
+                AppStoreReviewList(project: project, kit: kit)
+                NextActionPanel(model: model, kit: kit)
             }
         }
     }
@@ -1172,7 +1281,8 @@ struct FirstRunPanel: View {
 }
 
 struct AppStoreReviewList: View {
-    @Bindable var model: LaunchKitAppModel
+    let project: DiscoveredProjectCandidate
+    let kit: ReleaseKitState
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1183,17 +1293,17 @@ struct AppStoreReviewList: View {
                 title: "Release plan",
                 description: "What LaunchKit intends to prepare, fix, and gate before anything public changes.",
                 icon: "checklist.checked",
-                status: model.releasePlanStatus.rawValue,
-                content: model.generatedReleasePlan
+                status: kit.releasePlanStatus.rawValue,
+                content: kit.generatedReleasePlan
             )
 
             AppStoreReviewSection(
                 title: "Title, subtitle, and positioning",
                 description: "The App Store name, subtitle, and short positioning copy.",
                 icon: "textformat",
-                status: model.metadataStatus.rawValue,
+                status: kit.metadataStatus.rawValue,
                 content: """
-                Name: \(model.selectedProject?.name ?? "Selected app")
+                Name: \(project.name)
                 Subtitle: \(metadataValue("Subtitle") ?? "Waiting for generated metadata.")
                 Promotional text: \(metadataValue("Promotional Text") ?? metadataValue("Promotional") ?? "Waiting for generated metadata.")
                 """
@@ -1203,15 +1313,15 @@ struct AppStoreReviewList: View {
                 title: "Description",
                 description: "The full App Store description users will see before downloading.",
                 icon: "doc.text",
-                status: model.metadataStatus.rawValue,
-                content: metadataValue("Description") ?? model.generatedMetadataDraft
+                status: kit.metadataStatus.rawValue,
+                content: metadataValue("Description") ?? kit.generatedMetadataDraft
             )
 
             AppStoreReviewSection(
                 title: "Keywords",
                 description: "Search keywords for App Store discovery.",
                 icon: "number",
-                status: model.metadataStatus.rawValue,
+                status: kit.metadataStatus.rawValue,
                 content: metadataValue("Keywords")
             )
 
@@ -1219,20 +1329,20 @@ struct AppStoreReviewList: View {
                 title: "Release notes",
                 description: "What changed in this build.",
                 icon: "megaphone",
-                status: model.metadataStatus.rawValue,
+                status: kit.metadataStatus.rawValue,
                 content: metadataValue("Release Notes") ?? metadataValue("Release notes")
             )
 
             ScreenshotReviewSection(
-                draft: model.generatedScreenshotDraft,
-                status: model.screenshotStatus.rawValue
+                draft: kit.generatedScreenshotDraft,
+                status: kit.screenshotStatus.rawValue
             )
 
             AppStoreReviewSection(
                 title: "Privacy",
                 description: "Privacy answers and disclosure notes to review before App Store Connect upload.",
                 icon: "hand.raised",
-                status: model.metadataStatus.rawValue,
+                status: kit.metadataStatus.rawValue,
                 content: metadataValue("Privacy Questions") ?? metadataValue("Privacy")
             )
 
@@ -1240,7 +1350,7 @@ struct AppStoreReviewList: View {
                 title: "Review notes",
                 description: "Reviewer instructions, demo account notes, and any gated functionality explanation.",
                 icon: "person.text.rectangle",
-                status: model.metadataStatus.rawValue,
+                status: kit.metadataStatus.rawValue,
                 content: metadataValue("Review Notes") ?? metadataValue("Review notes")
             )
 
@@ -1248,42 +1358,42 @@ struct AppStoreReviewList: View {
                 title: "In-app purchases",
                 description: "Products, subscription groups, StoreKit config, and sandbox testing notes.",
                 icon: "creditcard",
-                status: model.iapStatus.rawValue,
-                content: model.generatedIAPDraft
+                status: kit.iapStatus.rawValue,
+                content: kit.generatedIAPDraft
             )
 
             AppStoreReviewSection(
                 title: "Build, signing, and TestFlight",
                 description: "Local Apple tooling readiness before archive and upload.",
                 icon: "hammer",
-                status: model.appleToolsDisplayStatus,
-                content: model.appleConnectionMessage
+                status: kit.appleToolsDisplayStatus,
+                content: kit.appleConnectionMessage
             )
 
             AppStoreReviewSection(
                 title: "Compliance and fixes",
                 description: "Issues LaunchKit found that should be fixed or explicitly accepted before submission.",
                 icon: "exclamationmark.triangle",
-                status: model.riskDisplayStatus,
+                status: kit.riskDisplayStatus,
                 content: complianceText
             )
         }
     }
 
     private var complianceText: String {
-        if model.riskStatus == .pending {
+        if kit.riskStatus == .pending {
             return "Waiting for project scan."
         }
-        if model.findings.isEmpty {
+        if kit.findings.isEmpty {
             return "No release blockers detected in the current scan."
         }
-        return model.findings
+        return kit.findings
             .map { "\($0.title)\n\($0.explanation)\nFix: \($0.recommendedFix ?? "Review manually.")" }
             .joined(separator: "\n\n")
     }
 
     private func metadataValue(_ label: String) -> String? {
-        guard let metadata = model.generatedMetadataDraft else { return nil }
+        guard let metadata = kit.generatedMetadataDraft else { return nil }
         let normalizedLabel = label.lowercased()
         let lines = metadata
             .split(separator: "\n", omittingEmptySubsequences: false)
@@ -1397,6 +1507,7 @@ struct ScreenshotReviewSection: View {
 
 struct NextActionPanel: View {
     @Bindable var model: LaunchKitAppModel
+    let kit: ReleaseKitState
 
     var body: some View {
         HStack(spacing: 14) {
@@ -1418,12 +1529,12 @@ struct NextActionPanel: View {
     }
 
     private var nextTitle: String {
-        if !model.findings.isEmpty { return "Review the fixes LaunchKit found" }
+        if !kit.findings.isEmpty { return "Review the fixes LaunchKit found" }
         return "Everything generated is ready to review"
     }
 
     private var nextButtonTitle: String {
-        if !model.findings.isEmpty { return "Review Fixes" }
+        if !kit.findings.isEmpty { return "Review Fixes" }
         return "Continue"
     }
 }
