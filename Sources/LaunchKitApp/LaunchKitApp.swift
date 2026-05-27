@@ -382,21 +382,19 @@ final class LaunchKitAppModel {
             updateReleaseKit(for: projectID) { kit in
                 kit.scanResult = result
                 kit.findings = result.findings
+                kit.metadataForm = AppStoreMetadataForm.fallback(projectName: project.name, scan: result)
+                kit.screenshotAssets = ScreenshotReviewAsset.defaults(projectName: project.name)
+                kit.iapForm = IAPReviewForm.fallback(scan: result)
                 kit.riskStatus = .ready
                 kit.releaseKitStatus = "Writing release plan"
                 kit.releasePlanStatus = .generating
                 kit.isGeneratingReleasePlan = true
             }
 
-            let releasePlan = try await localAgentBridge.complete(
-                provider: provider,
-                prompt: localAgentBridge.releasePlanPrompt(provider: provider, scan: result),
-                workingDirectoryURL: result.rootURL
-            )
+            let releasePlan = fallbackReleasePlan(project: project, scan: result)
             updateReleaseKit(for: projectID) { kit in
                 kit.generatedReleasePlan = releasePlan
-                kit.releasePlanStatus = .ready
-                kit.isGeneratingReleasePlan = false
+                kit.releasePlanStatus = .generating
                 kit.metadataStatus = .generating
                 kit.screenshotStatus = .generating
                 kit.iapStatus = .generating
@@ -448,6 +446,118 @@ final class LaunchKitAppModel {
         releaseKits[projectID] = ReleaseKitState()
     }
 
+    private func fallbackReleasePlan(
+        project: DiscoveredProjectCandidate,
+        scan: ProjectScanResult
+    ) -> String {
+        let blockers = scan.findings.filter { $0.severity == .blocker }.count
+        return """
+        Review \(project.name), fix \(blockers) blocker\(blockers == 1 ? "" : "s"), confirm metadata, confirm screenshots, then build and upload only after approval.
+        """
+    }
+
+    func updateMetadataField(projectID: String, field: AppStoreMetadataField, value: String) {
+        updateReleaseKit(for: projectID) { kit in
+            kit.metadataForm.update(field, value: value)
+        }
+    }
+
+    func addScreenshotAsset(projectID: String) {
+        updateReleaseKit(for: projectID) { kit in
+            let nextIndex = kit.screenshotAssets.count
+            kit.screenshotAssets.append(ScreenshotReviewAsset(
+                title: "Screenshot \(nextIndex + 1)",
+                caption: "Add the caption users should see on this App Store image.",
+                device: "iPhone 6.7\"",
+                visualDirection: "Generated screenshot slot ready for review.",
+                paletteIndex: nextIndex
+            ))
+            kit.screenshotStatus = .review
+        }
+    }
+
+    func deleteScreenshotAsset(projectID: String, assetID: UUID) {
+        updateReleaseKit(for: projectID) { kit in
+            kit.screenshotAssets.removeAll { $0.id == assetID }
+        }
+    }
+
+    func updateScreenshotAsset(
+        projectID: String,
+        assetID: UUID,
+        field: ScreenshotAssetField,
+        value: String
+    ) {
+        updateReleaseKit(for: projectID) { kit in
+            guard let index = kit.screenshotAssets.firstIndex(where: { $0.id == assetID }) else { return }
+            kit.screenshotAssets[index].update(field, value: value)
+        }
+    }
+
+    func setIAPEnabled(projectID: String, isEnabled: Bool) {
+        updateReleaseKit(for: projectID) { kit in
+            kit.iapForm.isEnabled = isEnabled
+            if isEnabled, kit.iapForm.products.isEmpty {
+                kit.iapForm.products = [
+                    IAPProductDraft(
+                        productID: "premium_monthly",
+                        displayName: "Premium Monthly",
+                        kind: .autoRenewable,
+                        reviewNote: "Confirm benefits, price, and subscription terms before creating this in App Store Connect."
+                    )
+                ]
+            }
+            kit.iapStatus = .review
+        }
+    }
+
+    func updateIAPSetupNote(projectID: String, value: String) {
+        updateReleaseKit(for: projectID) { kit in
+            kit.iapForm.setupNote = value
+        }
+    }
+
+    func addIAPProduct(projectID: String) {
+        updateReleaseKit(for: projectID) { kit in
+            kit.iapForm.isEnabled = true
+            kit.iapForm.products.append(IAPProductDraft(
+                productID: "product_\(kit.iapForm.products.count + 1)",
+                displayName: "New Product",
+                kind: .nonConsumable,
+                reviewNote: "Review product details before any live App Store Connect change."
+            ))
+            kit.iapStatus = .review
+        }
+    }
+
+    func deleteIAPProduct(projectID: String, productID: UUID) {
+        updateReleaseKit(for: projectID) { kit in
+            kit.iapForm.products.removeAll { $0.id == productID }
+            if kit.iapForm.products.isEmpty {
+                kit.iapForm.isEnabled = false
+            }
+        }
+    }
+
+    func updateIAPProduct(
+        projectID: String,
+        productID: UUID,
+        field: IAPProductField,
+        value: String
+    ) {
+        updateReleaseKit(for: projectID) { kit in
+            guard let index = kit.iapForm.products.firstIndex(where: { $0.id == productID }) else { return }
+            kit.iapForm.products[index].update(field, value: value)
+        }
+    }
+
+    func updateIAPProductKind(projectID: String, productID: UUID, kind: IAPProductKind) {
+        updateReleaseKit(for: projectID) { kit in
+            guard let index = kit.iapForm.products.firstIndex(where: { $0.id == productID }) else { return }
+            kit.iapForm.products[index].kind = kind
+        }
+    }
+
     private func generateRemainingReleaseKitSections(
         scan: ProjectScanResult,
         projectID: String,
@@ -455,6 +565,19 @@ final class LaunchKitAppModel {
         releasePlan: String
     ) async {
         await withTaskGroup(of: ReleaseKitGeneratedSection.self) { group in
+            group.addTask { [localAgentBridge] in
+                do {
+                    let output = try await localAgentBridge.complete(
+                        provider: provider,
+                        prompt: localAgentBridge.releasePlanPrompt(provider: provider, scan: scan),
+                        workingDirectoryURL: scan.rootURL
+                    )
+                    return .releasePlan(output)
+                } catch {
+                    return .failed(.releasePlan, error.localizedDescription)
+                }
+            }
+
             group.addTask { [localAgentBridge] in
                 do {
                     let output = try await localAgentBridge.complete(
@@ -511,16 +634,41 @@ final class LaunchKitAppModel {
 
     private func applyGeneratedSection(_ section: ReleaseKitGeneratedSection, projectID: String) {
         switch section {
+        case let .releasePlan(output):
+            updateReleaseKit(for: projectID) { kit in
+                kit.generatedReleasePlan = output
+                kit.releasePlanStatus = .ready
+                kit.isGeneratingReleasePlan = false
+                kit.releaseKitStatus = "Release plan ready"
+            }
         case let .metadata(output):
             updateReleaseKit(for: projectID) { kit in
                 kit.generatedMetadataDraft = output
+                kit.metadataForm = kit.metadataForm.applying(agentOutput: output)
                 kit.metadataStatus = .ready
                 kit.isGeneratingMetadataDraft = false
                 kit.releaseKitStatus = "Metadata ready"
             }
         case let .screenshots(output):
             updateReleaseKit(for: projectID) { kit in
-                kit.generatedScreenshotDraft = GeneratedScreenshotDraft(output: output)
+                let draft = GeneratedScreenshotDraft(output: output)
+                kit.generatedScreenshotDraft = draft
+                if kit.screenshotAssets.isEmpty {
+                    kit.screenshotAssets = [
+                        ScreenshotReviewAsset(
+                            title: draft.title,
+                            caption: draft.caption,
+                            device: "iPhone 6.7\"",
+                            visualDirection: draft.visualDirection,
+                            paletteIndex: draft.paletteIndex
+                        )
+                    ]
+                } else {
+                    kit.screenshotAssets[0].title = draft.title
+                    kit.screenshotAssets[0].caption = draft.caption
+                    kit.screenshotAssets[0].visualDirection = draft.visualDirection
+                    kit.screenshotAssets[0].paletteIndex = draft.paletteIndex
+                }
                 kit.screenshotStatus = .review
                 kit.isGeneratingScreenshotDraft = false
                 kit.releaseKitStatus = "Screenshot draft ready"
@@ -528,6 +676,7 @@ final class LaunchKitAppModel {
         case let .iap(output):
             updateReleaseKit(for: projectID) { kit in
                 kit.generatedIAPDraft = output
+                kit.iapForm = kit.iapForm.applying(agentOutput: output)
                 kit.iapStatus = .review
                 kit.isGeneratingIAPDraft = false
                 kit.releaseKitStatus = "Purchases ready"
@@ -543,19 +692,22 @@ final class LaunchKitAppModel {
         case let .failed(section, message):
             updateReleaseKit(for: projectID) { kit in
                 switch section {
+                case .releasePlan:
+                    kit.releasePlanStatus = .review
+                    kit.isGeneratingReleasePlan = false
                 case .metadata:
-                    kit.metadataStatus = .failed
+                    kit.metadataStatus = .review
                     kit.isGeneratingMetadataDraft = false
                 case .screenshots:
-                    kit.screenshotStatus = .failed
+                    kit.screenshotStatus = .review
                     kit.isGeneratingScreenshotDraft = false
                 case .iap:
-                    kit.iapStatus = .failed
+                    kit.iapStatus = .review
                     kit.isGeneratingIAPDraft = false
                 case .appleTools:
                     kit.appleToolsStatus = .failed
                 }
-                kit.releaseKitStatus = "\(section.title) failed"
+                kit.releaseKitStatus = "\(section.title) needs review"
             }
             events.insert(WorkflowEvent(
                 phase: section.phase,
@@ -736,9 +888,285 @@ enum ReleaseKitSectionStatus: String {
     case failed = "Failed"
 }
 
+enum AppStoreMetadataField {
+    case name
+    case subtitle
+    case promotionalText
+    case description
+    case keywords
+    case releaseNotes
+    case privacyNotes
+    case reviewNotes
+}
+
+struct AppStoreMetadataForm: Hashable {
+    var name = ""
+    var subtitle = ""
+    var promotionalText = ""
+    var description = ""
+    var keywords = ""
+    var releaseNotes = ""
+    var privacyNotes = ""
+    var reviewNotes = ""
+
+    static func fallback(projectName: String, scan: ProjectScanResult?) -> AppStoreMetadataForm {
+        let projectType = scan?.projectType.rawValue ?? "Apple"
+        let capabilities = scan?.capabilities.map(\.rawValue).joined(separator: ", ")
+        return AppStoreMetadataForm(
+            name: projectName,
+            subtitle: "\(projectType) app ready for review",
+            promotionalText: "Review this short launch message before it appears in App Store Connect.",
+            description: """
+            \(projectName) is ready for App Store review.
+
+            Replace this draft with a clear customer-facing description of what the app does, who it helps, and the main benefit users should expect.
+            """,
+            keywords: keywordFallback(projectName: projectName, scan: scan),
+            releaseNotes: "Initial App Store release candidate prepared with LaunchKit.",
+            privacyNotes: capabilities?.isEmpty == false
+                ? "Review detected capabilities before answering App Store privacy questions: \(capabilities!)."
+                : "Review app data collection, tracking, account deletion, and third-party SDK behavior before submission.",
+            reviewNotes: "Add demo credentials, reviewer instructions, or hardware/account requirements here before submission."
+        )
+    }
+
+    func applying(agentOutput: String) -> AppStoreMetadataForm {
+        var form = self
+        form.subtitle = Self.section("Subtitle", in: agentOutput) ?? subtitle
+        form.promotionalText = Self.section("Promotional Text", in: agentOutput)
+            ?? Self.section("Promotional", in: agentOutput)
+            ?? promotionalText
+        form.description = Self.section("Description", in: agentOutput) ?? description
+        form.keywords = Self.section("Keywords", in: agentOutput) ?? keywords
+        form.releaseNotes = Self.section("Release Notes", in: agentOutput)
+            ?? Self.section("Release notes", in: agentOutput)
+            ?? releaseNotes
+        form.privacyNotes = Self.section("Privacy Questions", in: agentOutput)
+            ?? Self.section("Privacy", in: agentOutput)
+            ?? privacyNotes
+        form.reviewNotes = Self.section("Review Notes", in: agentOutput)
+            ?? Self.section("Review notes", in: agentOutput)
+            ?? reviewNotes
+        return form
+    }
+
+    mutating func update(_ field: AppStoreMetadataField, value: String) {
+        switch field {
+        case .name: name = value
+        case .subtitle: subtitle = value
+        case .promotionalText: promotionalText = value
+        case .description: description = value
+        case .keywords: keywords = value
+        case .releaseNotes: releaseNotes = value
+        case .privacyNotes: privacyNotes = value
+        case .reviewNotes: reviewNotes = value
+        }
+    }
+
+    func value(for field: AppStoreMetadataField) -> String {
+        switch field {
+        case .name: name
+        case .subtitle: subtitle
+        case .promotionalText: promotionalText
+        case .description: description
+        case .keywords: keywords
+        case .releaseNotes: releaseNotes
+        case .privacyNotes: privacyNotes
+        case .reviewNotes: reviewNotes
+        }
+    }
+
+    private static func keywordFallback(projectName: String, scan: ProjectScanResult?) -> String {
+        let base = projectName
+            .split { !$0.isLetter && !$0.isNumber }
+            .map(String.init)
+        let capabilityKeywords = scan?.capabilities.map(\.rawValue) ?? []
+        return (base + capabilityKeywords + ["productivity", "utility"])
+            .map { $0.lowercased() }
+            .prefix(8)
+            .joined(separator: ", ")
+    }
+
+    private static func section(_ label: String, in text: String) -> String? {
+        let labels = [
+            "subtitle",
+            "description",
+            "keywords",
+            "release notes",
+            "review notes",
+            "privacy questions",
+            "privacy",
+            "promotional text",
+            "promotional"
+        ]
+        let normalizedLabel = label.lowercased()
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+        for index in lines.indices {
+            let cleaned = cleanedHeading(lines[index])
+            let lowercased = cleaned.lowercased()
+            guard lowercased.hasPrefix("\(normalizedLabel):") || lowercased == normalizedLabel else { continue }
+
+            let inlineValue = cleaned
+                .dropFirst(label.count)
+                .trimmingCharacters(in: CharacterSet(charactersIn: ": ").union(.whitespacesAndNewlines))
+            if !inlineValue.isEmpty {
+                return String(inlineValue)
+            }
+
+            let following = lines.dropFirst(index + 1)
+                .prefix { line in
+                    let lower = cleanedHeading(line).lowercased()
+                    return !labels.contains { lower.hasPrefix("\($0):") || lower == $0 }
+                }
+                .map(cleanedBody)
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return following.isEmpty ? nil : following
+        }
+        return nil
+    }
+
+    private static func cleanedHeading(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "**", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: " -#`*").union(.whitespacesAndNewlines))
+    }
+
+    private static func cleanedBody(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "**", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: " \t`"))
+    }
+}
+
+enum ScreenshotAssetField {
+    case title
+    case caption
+    case device
+}
+
+struct ScreenshotReviewAsset: Identifiable, Hashable {
+    var id = UUID()
+    var title: String
+    var caption: String
+    var device: String
+    var visualDirection: String
+    var paletteIndex: Int
+
+    static func defaults(projectName: String) -> [ScreenshotReviewAsset] {
+        [
+            ScreenshotReviewAsset(
+                title: "\(projectName) at a glance",
+                caption: "Show the first screen users understand in seconds.",
+                device: "iPhone 6.7\"",
+                visualDirection: "Primary app screen with clean App Store framing.",
+                paletteIndex: 0
+            ),
+            ScreenshotReviewAsset(
+                title: "Core workflow",
+                caption: "Highlight the action users perform most often.",
+                device: "iPhone 6.7\"",
+                visualDirection: "A focused in-app moment with concise caption space.",
+                paletteIndex: 1
+            ),
+            ScreenshotReviewAsset(
+                title: "Review before release",
+                caption: "Show the result, summary, or confirmation state.",
+                device: "iPhone 6.7\"",
+                visualDirection: "Polished final state with clear benefit-oriented copy.",
+                paletteIndex: 2
+            )
+        ]
+    }
+
+    var palette: [Color] {
+        GeneratedScreenshotDraft.palettes[paletteIndex % GeneratedScreenshotDraft.palettes.count]
+    }
+
+    mutating func update(_ field: ScreenshotAssetField, value: String) {
+        switch field {
+        case .title: title = value
+        case .caption: caption = value
+        case .device: device = value
+        }
+    }
+}
+
+enum IAPProductKind: String, CaseIterable, Identifiable, Hashable {
+    case autoRenewable = "Subscription"
+    case nonConsumable = "One-time unlock"
+    case consumable = "Consumable"
+
+    var id: String { rawValue }
+}
+
+enum IAPProductField {
+    case productID
+    case displayName
+    case reviewNote
+}
+
+struct IAPProductDraft: Identifiable, Hashable {
+    var id = UUID()
+    var productID: String
+    var displayName: String
+    var kind: IAPProductKind
+    var reviewNote: String
+
+    mutating func update(_ field: IAPProductField, value: String) {
+        switch field {
+        case .productID: productID = value
+        case .displayName: displayName = value
+        case .reviewNote: reviewNote = value
+        }
+    }
+}
+
+struct IAPReviewForm: Hashable {
+    var isEnabled = false
+    var setupNote = "No in-app purchases planned for this release."
+    var products: [IAPProductDraft] = []
+
+    static func fallback(scan: ProjectScanResult?) -> IAPReviewForm {
+        let detectedStoreKit = scan?.capabilities.contains(.inAppPurchase) == true
+        if detectedStoreKit {
+            return IAPReviewForm(
+                isEnabled: true,
+                setupNote: "StoreKit or IAP capability was detected. Review product IDs and pricing before any live App Store Connect change.",
+                products: [
+                    IAPProductDraft(
+                        productID: "premium_monthly",
+                        displayName: "Premium Monthly",
+                        kind: .autoRenewable,
+                        reviewNote: "Confirm subscription benefits, restore purchase behavior, and price before upload."
+                    )
+                ]
+            )
+        }
+        return IAPReviewForm(
+            isEnabled: false,
+            setupNote: "No StoreKit/IAP capability was detected. Leave this off unless this release sells digital content.",
+            products: []
+        )
+    }
+
+    func applying(agentOutput: String) -> IAPReviewForm {
+        guard isEnabled else { return self }
+        var form = self
+        if !agentOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            form.setupNote = "IAP draft prepared locally. Review product IDs, pricing, restore behavior, and subscription terms before any App Store Connect change."
+        }
+        return form
+    }
+}
+
 struct ReleaseKitState {
     var scanResult: ProjectScanResult?
     var findings: [DiagnosticFinding] = []
+    var metadataForm = AppStoreMetadataForm()
+    var screenshotAssets: [ScreenshotReviewAsset] = []
+    var iapForm = IAPReviewForm()
     var generatedReleasePlan: String?
     var generatedScreenshotDraft: GeneratedScreenshotDraft?
     var generatedMetadataDraft: String?
@@ -780,6 +1208,7 @@ struct ReleaseKitState {
 }
 
 enum ReleaseKitGeneratedSection: Sendable {
+    case releasePlan(String)
     case metadata(String)
     case screenshots(String)
     case iap(String)
@@ -788,6 +1217,7 @@ enum ReleaseKitGeneratedSection: Sendable {
 }
 
 enum ReleaseKitGeneratedSectionID: Sendable {
+    case releasePlan
     case metadata
     case screenshots
     case iap
@@ -795,6 +1225,7 @@ enum ReleaseKitGeneratedSectionID: Sendable {
 
     var title: String {
         switch self {
+        case .releasePlan: "Release plan"
         case .metadata: "Metadata"
         case .screenshots: "Screenshots"
         case .iap: "Purchases"
@@ -804,6 +1235,7 @@ enum ReleaseKitGeneratedSectionID: Sendable {
 
     var phase: WorkflowPhase {
         switch self {
+        case .releasePlan: .planning
         case .metadata: .metadata
         case .screenshots: .screenshots
         case .iap: .payments
@@ -848,7 +1280,7 @@ struct GeneratedScreenshotDraft: Identifiable, Hashable {
         paletteIndex: 0
     )
 
-    private static let palettes: [[Color]] = [
+    static let palettes: [[Color]] = [
         [
             Color(red: 0.05, green: 0.07, blue: 0.10),
             Color(red: 0.00, green: 0.46, blue: 0.52),
@@ -1244,7 +1676,7 @@ struct ReleaseKitReview: View {
             if !kit.hasStartedReleaseKit {
                 FirstRunPanel()
             } else {
-                AppStoreReviewList(project: project, kit: kit)
+                AppStoreReviewList(model: model, project: project, kit: kit)
                 NextActionPanel(model: model, kit: kit)
             }
         }
@@ -1281,6 +1713,7 @@ struct FirstRunPanel: View {
 }
 
 struct AppStoreReviewList: View {
+    @Bindable var model: LaunchKitAppModel
     let project: DiscoveredProjectCandidate
     let kit: ReleaseKitState
 
@@ -1291,76 +1724,78 @@ struct AppStoreReviewList: View {
 
             AppStoreReviewSection(
                 title: "Release plan",
-                description: "What LaunchKit intends to prepare, fix, and gate before anything public changes.",
+                description: "Concise generated plan for what happens next.",
                 icon: "checklist.checked",
                 status: kit.releasePlanStatus.rawValue,
                 content: kit.generatedReleasePlan
             )
 
-            AppStoreReviewSection(
+            EditableSectionHeader(
                 title: "Title, subtitle, and positioning",
-                description: "The App Store name, subtitle, and short positioning copy.",
+                description: "These fields map directly to App Store Connect metadata.",
                 icon: "textformat",
-                status: kit.metadataStatus.rawValue,
-                content: """
-                Name: \(project.name)
-                Subtitle: \(metadataValue("Subtitle") ?? "Waiting for generated metadata.")
-                Promotional text: \(metadataValue("Promotional Text") ?? metadataValue("Promotional") ?? "Waiting for generated metadata.")
-                """
-            )
+                status: kit.metadataStatus.rawValue
+            ) {
+                VStack(alignment: .leading, spacing: 12) {
+                    ReviewTextField(label: "Name", text: metadataBinding(.name))
+                    ReviewTextField(label: "Subtitle", text: metadataBinding(.subtitle))
+                    ReviewTextEditor(label: "Promotional text", text: metadataBinding(.promotionalText), minHeight: 76)
+                }
+            }
 
-            AppStoreReviewSection(
+            EditableSectionHeader(
                 title: "Description",
-                description: "The full App Store description users will see before downloading.",
+                description: "Full App Store description.",
                 icon: "doc.text",
-                status: kit.metadataStatus.rawValue,
-                content: metadataValue("Description") ?? kit.generatedMetadataDraft
-            )
+                status: kit.metadataStatus.rawValue
+            ) {
+                ReviewTextEditor(label: "Description", text: metadataBinding(.description), minHeight: 170)
+            }
 
-            AppStoreReviewSection(
+            EditableSectionHeader(
                 title: "Keywords",
-                description: "Search keywords for App Store discovery.",
+                description: "Comma-separated search keywords.",
                 icon: "number",
-                status: kit.metadataStatus.rawValue,
-                content: metadataValue("Keywords")
-            )
+                status: kit.metadataStatus.rawValue
+            ) {
+                ReviewTextField(label: "Keywords", text: metadataBinding(.keywords))
+            }
 
-            AppStoreReviewSection(
+            EditableSectionHeader(
                 title: "Release notes",
-                description: "What changed in this build.",
+                description: "What users and reviewers should know about this build.",
                 icon: "megaphone",
-                status: kit.metadataStatus.rawValue,
-                content: metadataValue("Release Notes") ?? metadataValue("Release notes")
-            )
+                status: kit.metadataStatus.rawValue
+            ) {
+                ReviewTextEditor(label: "Release notes", text: metadataBinding(.releaseNotes), minHeight: 100)
+            }
 
             ScreenshotReviewSection(
-                draft: kit.generatedScreenshotDraft,
+                model: model,
+                projectID: project.id,
+                assets: kit.screenshotAssets,
                 status: kit.screenshotStatus.rawValue
             )
 
-            AppStoreReviewSection(
+            EditableSectionHeader(
                 title: "Privacy",
-                description: "Privacy answers and disclosure notes to review before App Store Connect upload.",
+                description: "Answers to review before App Store privacy disclosure.",
                 icon: "hand.raised",
-                status: kit.metadataStatus.rawValue,
-                content: metadataValue("Privacy Questions") ?? metadataValue("Privacy")
-            )
+                status: kit.metadataStatus.rawValue
+            ) {
+                ReviewTextEditor(label: "Privacy notes", text: metadataBinding(.privacyNotes), minHeight: 120)
+            }
 
-            AppStoreReviewSection(
+            EditableSectionHeader(
                 title: "Review notes",
-                description: "Reviewer instructions, demo account notes, and any gated functionality explanation.",
+                description: "Instructions, demo credentials, or reviewer context.",
                 icon: "person.text.rectangle",
-                status: kit.metadataStatus.rawValue,
-                content: metadataValue("Review Notes") ?? metadataValue("Review notes")
-            )
+                status: kit.metadataStatus.rawValue
+            ) {
+                ReviewTextEditor(label: "Review notes", text: metadataBinding(.reviewNotes), minHeight: 110)
+            }
 
-            AppStoreReviewSection(
-                title: "In-app purchases",
-                description: "Products, subscription groups, StoreKit config, and sandbox testing notes.",
-                icon: "creditcard",
-                status: kit.iapStatus.rawValue,
-                content: kit.generatedIAPDraft
-            )
+            IAPReviewSection(model: model, projectID: project.id, form: kit.iapForm, status: kit.iapStatus.rawValue)
 
             AppStoreReviewSection(
                 title: "Build, signing, and TestFlight",
@@ -1388,36 +1823,19 @@ struct AppStoreReviewList: View {
             return "No release blockers detected in the current scan."
         }
         return kit.findings
-            .map { "\($0.title)\n\($0.explanation)\nFix: \($0.recommendedFix ?? "Review manually.")" }
+            .map { "\($0.title)\n\($0.recommendedFix ?? $0.explanation)" }
             .joined(separator: "\n\n")
     }
 
-    private func metadataValue(_ label: String) -> String? {
-        guard let metadata = kit.generatedMetadataDraft else { return nil }
-        let normalizedLabel = label.lowercased()
-        let lines = metadata
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map(String.init)
-
-        for index in lines.indices {
-            let trimmed = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
-            let lowercased = trimmed.lowercased()
-            guard lowercased.hasPrefix("\(normalizedLabel):") || lowercased == normalizedLabel else { continue }
-            let inlineValue = trimmed.dropFirst(label.count).trimmingCharacters(in: CharacterSet(charactersIn: ": ").union(.whitespacesAndNewlines))
-            if !inlineValue.isEmpty {
-                return inlineValue
+    private func metadataBinding(_ field: AppStoreMetadataField) -> Binding<String> {
+        Binding(
+            get: {
+                model.releaseKit(for: project).metadataForm.value(for: field)
+            },
+            set: { value in
+                model.updateMetadataField(projectID: project.id, field: field, value: value)
             }
-            let following = lines.dropFirst(index + 1)
-                .prefix { line in
-                    let lower = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    return !["subtitle:", "description:", "keywords:", "release notes:", "review notes:", "privacy questions:", "promotional text:"]
-                        .contains(where: lower.hasPrefix)
-                }
-                .joined(separator: "\n")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return following.isEmpty ? nil : following
-        }
-        return nil
+        )
     }
 }
 
@@ -1467,14 +1885,17 @@ struct AppStoreReviewSection: View {
     }
 }
 
-struct ScreenshotReviewSection: View {
-    let draft: GeneratedScreenshotDraft?
+struct EditableSectionHeader<Content: View>: View {
+    let title: String
+    let description: String
+    let icon: String
     let status: String
+    @ViewBuilder var content: Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label("Images and screenshots", systemImage: "photo.on.rectangle")
+                Label(title, systemImage: icon)
                     .font(.headline)
                 Spacer()
                 Text(status)
@@ -1483,25 +1904,286 @@ struct ScreenshotReviewSection: View {
                     .padding(.vertical, 4)
                     .background(.tertiary, in: Capsule())
             }
-            Text("App Store screenshots, image direction, captions, and review notes before upload.")
+            Text(description)
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            if let draft {
-                Text(draft.title)
-                    .font(.title3.weight(.semibold))
-                Text(draft.caption)
-                    .foregroundStyle(.secondary)
-                Text(draft.visualDirection)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            } else {
-                Text("Waiting for screenshot direction.")
-                    .foregroundStyle(.secondary)
-            }
+            content
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct ReviewTextField: View {
+    let label: String
+    @Binding var text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            TextField(label, text: $text)
+                .textFieldStyle(.roundedBorder)
+        }
+    }
+}
+
+struct ReviewTextEditor: View {
+    let label: String
+    @Binding var text: String
+    var minHeight: CGFloat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            TextEditor(text: $text)
+                .font(.body)
+                .frame(minHeight: minHeight)
+                .padding(8)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+    }
+}
+
+struct ScreenshotReviewSection: View {
+    @Bindable var model: LaunchKitAppModel
+    let projectID: String
+    let assets: [ScreenshotReviewAsset]
+    let status: String
+
+    var body: some View {
+        EditableSectionHeader(
+            title: "Images and screenshots",
+            description: "Generated screenshot slots. Edit captions, add more, or delete anything you do not want.",
+            icon: "photo.on.rectangle",
+            status: status
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if assets.isEmpty {
+                    Text("No screenshots yet.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(assets) { asset in
+                        ScreenshotAssetRow(model: model, projectID: projectID, asset: asset)
+                    }
+                }
+
+                Button {
+                    model.addScreenshotAsset(projectID: projectID)
+                } label: {
+                    Label("Add image", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+}
+
+struct ScreenshotAssetRow: View {
+    @Bindable var model: LaunchKitAppModel
+    let projectID: String
+    let asset: ScreenshotReviewAsset
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            ScreenshotPreviewCard(asset: asset)
+                .frame(width: 178, height: 236)
+
+            VStack(alignment: .leading, spacing: 10) {
+                ReviewTextField(label: "Title", text: binding(.title))
+                ReviewTextField(label: "Caption", text: binding(.caption))
+                ReviewTextField(label: "Device", text: binding(.device))
+                Text(asset.visualDirection)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
+
+            Button {
+                model.deleteScreenshotAsset(projectID: projectID, assetID: asset.id)
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.bordered)
+            .help("Delete image")
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func binding(_ field: ScreenshotAssetField) -> Binding<String> {
+        Binding(
+            get: {
+                guard let asset = model.releaseKits[projectID]?.screenshotAssets.first(where: { $0.id == self.asset.id }) else {
+                    return ""
+                }
+                switch field {
+                case .title: return asset.title
+                case .caption: return asset.caption
+                case .device: return asset.device
+                }
+            },
+            set: { value in
+                model.updateScreenshotAsset(projectID: projectID, assetID: asset.id, field: field, value: value)
+            }
+        )
+    }
+}
+
+struct ScreenshotPreviewCard: View {
+    let asset: ScreenshotReviewAsset
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            LinearGradient(
+                colors: asset.palette,
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            VStack(alignment: .leading, spacing: 8) {
+                Spacer()
+                Text(asset.title)
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(3)
+                Text(asset.caption)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.82))
+                    .lineLimit(4)
+            }
+            .padding(14)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(.white.opacity(0.18), lineWidth: 1)
+        }
+    }
+}
+
+struct IAPReviewSection: View {
+    @Bindable var model: LaunchKitAppModel
+    let projectID: String
+    let form: IAPReviewForm
+    let status: String
+
+    var body: some View {
+        EditableSectionHeader(
+            title: "In-app purchases",
+            description: "Simple draft products only. Pricing and live App Store Connect changes still require approval.",
+            icon: "creditcard",
+            status: status
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Use in-app purchases for this release", isOn: enabledBinding)
+                    .toggleStyle(.switch)
+
+                ReviewTextEditor(label: "Setup note", text: setupNoteBinding, minHeight: 78)
+
+                if form.isEnabled {
+                    ForEach(form.products) { product in
+                        IAPProductRow(model: model, projectID: projectID, product: product)
+                    }
+
+                    Button {
+                        model.addIAPProduct(projectID: projectID)
+                    } label: {
+                        Label("Add product", systemImage: "plus")
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+    }
+
+    private var enabledBinding: Binding<Bool> {
+        Binding(
+            get: { model.releaseKits[projectID]?.iapForm.isEnabled ?? form.isEnabled },
+            set: { model.setIAPEnabled(projectID: projectID, isEnabled: $0) }
+        )
+    }
+
+    private var setupNoteBinding: Binding<String> {
+        Binding(
+            get: { model.releaseKits[projectID]?.iapForm.setupNote ?? form.setupNote },
+            set: { model.updateIAPSetupNote(projectID: projectID, value: $0) }
+        )
+    }
+}
+
+struct IAPProductRow: View {
+    @Bindable var model: LaunchKitAppModel
+    let projectID: String
+    let product: IAPProductDraft
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(product.displayName)
+                    .font(.headline)
+                Spacer()
+                Button {
+                    model.deleteIAPProduct(projectID: projectID, productID: product.id)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.bordered)
+                .help("Delete product")
+            }
+
+            HStack(spacing: 10) {
+                ReviewTextField(label: "Product ID", text: textBinding(.productID))
+                ReviewTextField(label: "Display name", text: textBinding(.displayName))
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Type")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Picker("Type", selection: kindBinding) {
+                        ForEach(IAPProductKind.allCases) { kind in
+                            Text(kind.rawValue).tag(kind)
+                        }
+                    }
+                    .labelsHidden()
+                }
+            }
+
+            ReviewTextEditor(label: "Review note", text: textBinding(.reviewNote), minHeight: 70)
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func textBinding(_ field: IAPProductField) -> Binding<String> {
+        Binding(
+            get: {
+                guard let product = model.releaseKits[projectID]?.iapForm.products.first(where: { $0.id == self.product.id }) else {
+                    return ""
+                }
+                switch field {
+                case .productID: return product.productID
+                case .displayName: return product.displayName
+                case .reviewNote: return product.reviewNote
+                }
+            },
+            set: { value in
+                model.updateIAPProduct(projectID: projectID, productID: product.id, field: field, value: value)
+            }
+        )
+    }
+
+    private var kindBinding: Binding<IAPProductKind> {
+        Binding(
+            get: {
+                model.releaseKits[projectID]?.iapForm.products.first(where: { $0.id == product.id })?.kind ?? product.kind
+            },
+            set: { kind in
+                model.updateIAPProductKind(projectID: projectID, productID: product.id, kind: kind)
+            }
+        )
     }
 }
 

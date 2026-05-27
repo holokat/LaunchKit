@@ -347,7 +347,8 @@ public actor LocalAgentBridge {
         return """
         You are LaunchKit's \(provider.subscriptionLabel) metadata assistant.
         Draft App Store metadata from local evidence only.
-        Return concise sections with labels: Subtitle, Description, Keywords, Release Notes, Review Notes, Privacy Questions.
+        Return only editable field labels and values: Subtitle, Promotional Text, Description, Keywords, Release Notes, Review Notes, Privacy Questions.
+        Do not use markdown headings, bullets, analysis, or implementation notes.
         Mark assumptions clearly. Do not invent unsupported claims, pricing, awards, or compliance promises.
 
         Project facts:
@@ -363,7 +364,11 @@ public actor LocalAgentBridge {
         return """
         You are LaunchKit's \(provider.subscriptionLabel) payments planner.
         Draft a local StoreKit/IAP setup plan for an Apple app.
-        Return concise sections with labels: Product Candidates, Subscription Groups, StoreKit Config, Sandbox Testing, Approval Gates.
+        Return only concise field values:
+        Use IAP: yes/no
+        Setup Note: one short sentence
+        Product: product_id | display name | subscription/one-time/consumable | review note
+        Do not use markdown headings, bullets, long explanations, or implementation checklists.
         Do not choose live prices. Do not propose live App Store Connect mutations without explicit approval.
         StoreKit detected in scan: \(detectedStoreKit ? "yes" : "no")
         """
