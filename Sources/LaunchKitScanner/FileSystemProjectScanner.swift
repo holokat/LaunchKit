@@ -98,7 +98,7 @@ private struct ProjectFileIndex: Sendable {
 }
 
 private func shouldDescend(into url: URL, basename: String) -> Bool {
-    if basename == ".git" || basename == ".build" || basename == "DerivedData" {
+    if ignoredScanDirectories.contains(basename) {
         return false
     }
     if url.pathExtension == "xcodeproj" || url.pathExtension == "xcworkspace" {
@@ -106,6 +106,19 @@ private func shouldDescend(into url: URL, basename: String) -> Bool {
     }
     return true
 }
+
+private let ignoredScanDirectories = Set([
+    ".build",
+    ".dart_tool",
+    ".git",
+    ".swiftpm",
+    "DerivedData",
+    "Pods",
+    "build",
+    "dist",
+    "node_modules",
+    "target"
+])
 
 private let knownRootManifests = [
     "Package.swift",

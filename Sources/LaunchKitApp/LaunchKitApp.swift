@@ -21,7 +21,7 @@ struct LaunchKitApplication: App {
 
     var body: some Scene {
         WindowGroup {
-            LaunchKitRootView(model: model)
+            LaunchKitMainView(model: model)
                 .frame(minWidth: 1120, minHeight: 720)
         }
         .windowStyle(.hiddenTitleBar)
@@ -32,6 +32,7 @@ struct LaunchKitApplication: App {
 @MainActor
 final class LaunchKitAppModel {
     var selectedScreen: LaunchKitScreen = .home
+    var selectedProject: DiscoveredProjectCandidate?
     var scanResult: ProjectScanResult?
     var findings: [DiagnosticFinding] = LaunchKitSampleData.findings
     var plannedActions: [LaunchKitAction] = LaunchKitSampleData.actions
@@ -48,6 +49,9 @@ final class LaunchKitAppModel {
     var isGeneratingScreenshotDraft = false
     var isGeneratingMetadataDraft = false
     var isGeneratingIAPDraft = false
+    var isGeneratingReleaseKit = false
+    var didBootstrap = false
+    var releaseKitStatus = "Ready"
     var isConnectingApple = false
     var aiConnectionState: ConnectionState = .notConnected
     var appleConnectionState: ConnectionState = .notConnected
@@ -71,6 +75,28 @@ final class LaunchKitAppModel {
     private let discoveryService = ProjectDiscoveryService()
     private let localAgentBridge = LocalAgentBridge()
     private let appleProbe = AppleDeveloperEnvironmentProbe()
+
+    var isAIReady: Bool {
+        connectionState(for: selectedAIProvider) == .connected
+    }
+
+    var selectedProjectName: String {
+        selectedProject?.name ?? "No app selected"
+    }
+
+    func bootstrap() async {
+        guard !didBootstrap else { return }
+        didBootstrap = true
+        await refreshAllAgentStatuses()
+        if !isAIReady,
+           let connectedProvider = LocalAgentProvider.allCases.first(where: { connectionState(for: $0) == .connected }) {
+            selectedAIProvider = connectedProvider
+        }
+        await discoverProjects()
+        if selectedProject == nil {
+            selectedProject = discoveredProjects.first
+        }
+    }
 
     func refreshAgentStatus(provider: LocalAgentProvider) async {
         isCheckingAgent = true
@@ -287,6 +313,96 @@ final class LaunchKitAppModel {
         isGeneratingIAPDraft = false
     }
 
+    func selectProject(_ project: DiscoveredProjectCandidate) {
+        selectedProject = project
+        if scanResult?.rootURL != project.rootURL {
+            scanResult = nil
+            findings = []
+            generatedReleasePlan = nil
+            generatedScreenshotDraft = nil
+            generatedMetadataDraft = nil
+            generatedIAPDraft = nil
+            releaseKitStatus = "Ready"
+        }
+    }
+
+    func generateReleaseKit() async {
+        guard let project = selectedProject else { return }
+        guard await ensureSelectedAgentConnected(phase: .planning, taskName: "generate the release kit") else { return }
+
+        isGeneratingReleaseKit = true
+        isGeneratingReleasePlan = true
+        isGeneratingMetadataDraft = true
+        isGeneratingScreenshotDraft = true
+        isGeneratingIAPDraft = true
+        defer {
+            isGeneratingReleaseKit = false
+            isGeneratingReleasePlan = false
+            isGeneratingMetadataDraft = false
+            isGeneratingScreenshotDraft = false
+            isGeneratingIAPDraft = false
+        }
+
+        do {
+            releaseKitStatus = "Reading \(project.name)"
+            let result = try await scanner.scan(rootURL: project.rootURL)
+            scanResult = result
+            findings = result.findings
+
+            releaseKitStatus = "Writing release plan"
+            generatedReleasePlan = try await localAgentBridge.complete(
+                provider: selectedAIProvider,
+                prompt: localAgentBridge.releasePlanPrompt(provider: selectedAIProvider, scan: result),
+                workingDirectoryURL: result.rootURL
+            )
+
+            releaseKitStatus = "Drafting metadata"
+            generatedMetadataDraft = try await localAgentBridge.complete(
+                provider: selectedAIProvider,
+                prompt: localAgentBridge.metadataDraftPrompt(
+                    provider: selectedAIProvider,
+                    scan: result,
+                    releasePlan: generatedReleasePlan
+                ),
+                workingDirectoryURL: result.rootURL
+            )
+
+            releaseKitStatus = "Designing screenshot direction"
+            let screenshotOutput = try await localAgentBridge.complete(
+                provider: selectedAIProvider,
+                prompt: localAgentBridge.screenshotDraftPrompt(provider: selectedAIProvider, scan: result),
+                workingDirectoryURL: result.rootURL
+            )
+            generatedScreenshotDraft = GeneratedScreenshotDraft(output: screenshotOutput)
+
+            releaseKitStatus = "Preparing purchases"
+            generatedIAPDraft = try await localAgentBridge.complete(
+                provider: selectedAIProvider,
+                prompt: localAgentBridge.iapDraftPrompt(provider: selectedAIProvider, scan: result),
+                workingDirectoryURL: result.rootURL
+            )
+
+            releaseKitStatus = "Checking local Apple tools"
+            await connectApple()
+
+            releaseKitStatus = "Ready for review"
+            events.insert(WorkflowEvent(
+                phase: .planning,
+                title: "Release kit generated",
+                detail: "\(project.name) is ready for review.",
+                risk: .informational
+            ), at: 0)
+        } catch {
+            releaseKitStatus = "Stopped"
+            events.insert(WorkflowEvent(
+                phase: .planning,
+                title: "Release kit generation failed",
+                detail: error.localizedDescription,
+                risk: .medium
+            ), at: 0)
+        }
+    }
+
     func prepareSafeFixReview() {
         let reversibleWrites = plannedActions.filter { $0.category == .safeReversibleWrite }
         events.insert(WorkflowEvent(
@@ -399,6 +515,12 @@ final class LaunchKitAppModel {
         defer { isDiscoveringProjects = false }
         let projects = await discoveryService.discover()
         discoveredProjects = projects
+        if selectedProject == nil {
+            selectedProject = projects.first
+        } else if let selectedProject,
+                  !projects.contains(where: { $0.id == selectedProject.id }) {
+            self.selectedProject = projects.first
+        }
         events.insert(WorkflowEvent(
             phase: .scanning,
             title: "Project discovery completed",
@@ -578,6 +700,425 @@ struct Sidebar: View {
         case .submission: "paperplane"
         case .settings: "key"
         }
+    }
+}
+
+struct LaunchKitMainView: View {
+    @Bindable var model: LaunchKitAppModel
+
+    var body: some View {
+        HStack(spacing: 0) {
+            AppListPane(model: model)
+                .frame(width: 330)
+                .background(Color(nsColor: .controlBackgroundColor))
+
+            Divider()
+
+            ReleaseKitPane(model: model)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .task {
+            await model.bootstrap()
+        }
+    }
+}
+
+struct AppListPane: View {
+    @Bindable var model: LaunchKitAppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("LaunchKit")
+                    .font(.system(size: 26, weight: .semibold, design: .rounded))
+                Text(agentSummary)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            if !model.isAIReady {
+                LoginRequiredPanel(model: model)
+            }
+
+            HStack {
+                Text("Apps")
+                    .font(.headline)
+                Spacer()
+                if model.isDiscoveringProjects {
+                    ProgressView()
+                        .scaleEffect(0.65)
+                }
+            }
+
+            if model.discoveredProjects.isEmpty {
+                ContentUnavailableView(
+                    model.isDiscoveringProjects ? "Finding apps" : "No apps found",
+                    systemImage: "app.dashed",
+                    description: Text(model.isDiscoveringProjects ? "Looking in your developer folders." : "LaunchKit checks ~/code, ~/Developer, and ~/Projects.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(model.discoveredProjects) { project in
+                            AppListRow(
+                                project: project,
+                                isSelected: model.selectedProject?.id == project.id
+                            ) {
+                                model.selectProject(project)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(22)
+    }
+
+    private var agentSummary: String {
+        if model.isAIReady {
+            return "AI ready with \(model.selectedAIProvider.displayName)"
+        }
+        if model.connectionState(for: model.selectedAIProvider) == .missing {
+            return "\(model.selectedAIProvider.displayName) needs installing"
+        }
+        return "Sign in once to generate release kits"
+    }
+}
+
+struct LoginRequiredPanel: View {
+    @Bindable var model: LaunchKitAppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("AI", selection: $model.selectedAIProvider) {
+                ForEach(LocalAgentProvider.allCases) { provider in
+                    Text(provider.displayName).tag(provider)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Button {
+                Task {
+                    switch model.connectionState(for: model.selectedAIProvider) {
+                    case .missing:
+                        await model.installAgent(provider: model.selectedAIProvider)
+                    case .connected:
+                        break
+                    default:
+                        await model.connectAI(provider: model.selectedAIProvider)
+                    }
+                }
+            } label: {
+                Label(loginTitle, systemImage: "sparkles")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(model.isInstallingAgent || model.isLoggingIntoAgent || model.isCheckingAgent)
+
+            Text("Uses your local subscription login. No provider API keys.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var loginTitle: String {
+        if model.isInstallingAgent { return "Installing..." }
+        if model.isLoggingIntoAgent { return "Opening sign in..." }
+        switch model.connectionState(for: model.selectedAIProvider) {
+        case .missing: return "Install \(model.selectedAIProvider.displayName)"
+        case .connected: return "AI ready"
+        default: return "Sign in with \(model.selectedAIProvider.displayName)"
+        }
+    }
+}
+
+struct AppListRow: View {
+    let project: DiscoveredProjectCandidate
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 18, weight: .medium))
+                    .frame(width: 28, height: 28)
+                    .background(.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(project.name)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Text(project.rootURL.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+            }
+            .padding(10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(isSelected ? Color.accentColor.opacity(0.16) : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var icon: String {
+        switch project.projectType {
+        case .swiftPackage: "shippingbox"
+        case .reactNative, .flutter, .capacitor: "iphone.gen3"
+        default: "app"
+        }
+    }
+}
+
+struct ReleaseKitPane: View {
+    @Bindable var model: LaunchKitAppModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                if let project = model.selectedProject {
+                    SelectedAppHeader(model: model, project: project)
+                    ReleaseKitReview(model: model)
+                } else {
+                    EmptyAppSelectionView()
+                }
+            }
+            .padding(34)
+        }
+    }
+}
+
+struct EmptyAppSelectionView: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Select an app")
+                .font(.system(size: 34, weight: .semibold, design: .rounded))
+            Text("LaunchKit will generate everything needed for review from one button.")
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .padding(80)
+    }
+}
+
+struct SelectedAppHeader: View {
+    @Bindable var model: LaunchKitAppModel
+    let project: DiscoveredProjectCandidate
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(project.name)
+                        .font(.system(size: 38, weight: .semibold, design: .rounded))
+                    Text(project.rootURL.path)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Spacer()
+                Text(project.projectType.rawValue)
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(.tertiary, in: Capsule())
+            }
+
+            Button {
+                Task { await model.generateReleaseKit() }
+            } label: {
+                Label(primaryActionTitle, systemImage: model.isGeneratingReleaseKit ? "sparkles" : "wand.and.sparkles")
+                    .frame(minWidth: 220)
+            }
+            .controlSize(.large)
+            .buttonStyle(.borderedProminent)
+            .disabled(!model.isAIReady || model.isGeneratingReleaseKit)
+
+            if !model.isAIReady {
+                Text("Sign in with Codex or Claude Code first.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var primaryActionTitle: String {
+        model.isGeneratingReleaseKit ? model.releaseKitStatus : "Generate Release Kit"
+    }
+}
+
+struct ReleaseKitReview: View {
+    @Bindable var model: LaunchKitAppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if model.isGeneratingReleaseKit {
+                ProgressPanel(status: model.releaseKitStatus)
+            }
+
+            if model.generatedReleasePlan == nil,
+               model.generatedMetadataDraft == nil,
+               model.generatedScreenshotDraft == nil,
+               model.generatedIAPDraft == nil {
+                FirstRunPanel()
+            } else {
+                ReviewSummaryGrid(model: model)
+                NextActionPanel(model: model)
+            }
+        }
+    }
+}
+
+struct ProgressPanel: View {
+    let status: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+            Text(status)
+                .font(.headline)
+            Spacer()
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct FirstRunPanel: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("One click creates the release kit.")
+                .font(.headline)
+            Text("LaunchKit will inspect the app, draft the release plan, metadata, screenshot direction, IAP setup notes, and local Apple readiness, then stop for review.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(18)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct ReviewSummaryGrid: View {
+    @Bindable var model: LaunchKitAppModel
+
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 14)], spacing: 14) {
+            ReviewCard(title: "Release Plan", icon: "checklist.checked", status: model.generatedReleasePlan == nil ? "Pending" : "Ready", text: model.generatedReleasePlan)
+            ReviewCard(title: "Metadata", icon: "text.alignleft", status: model.generatedMetadataDraft == nil ? "Pending" : "Ready", text: model.generatedMetadataDraft)
+            ReviewCard(title: "Purchases", icon: "creditcard", status: model.generatedIAPDraft == nil ? "Pending" : "Review", text: model.generatedIAPDraft)
+            ScreenshotReviewCard(draft: model.generatedScreenshotDraft)
+            ReviewCard(title: "Risks", icon: "exclamationmark.triangle", status: model.findings.isEmpty ? "Clear" : "\(model.findings.count)", text: model.findings.map { "\($0.title)\n\($0.explanation)" }.joined(separator: "\n\n"))
+            ReviewCard(title: "Apple Tools", icon: "apple.logo", status: model.appleConnectionState.rawValue, text: model.appleConnectionMessage)
+        }
+    }
+}
+
+struct ReviewCard: View {
+    let title: String
+    let icon: String
+    let status: String
+    let text: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label(title, systemImage: icon)
+                    .font(.headline)
+                Spacer()
+                Text(status)
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.tertiary, in: Capsule())
+            }
+            Text(displayText)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(8)
+                .textSelection(.enabled)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: 170, alignment: .topLeading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var displayText: String {
+        guard let text, !text.isEmpty else { return "Generate the release kit to fill this in." }
+        return text
+    }
+}
+
+struct ScreenshotReviewCard: View {
+    let draft: GeneratedScreenshotDraft?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Screenshots", systemImage: "photo.on.rectangle")
+                    .font(.headline)
+                Spacer()
+                Text(draft == nil ? "Pending" : "Draft")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.tertiary, in: Capsule())
+            }
+            if let draft {
+                Text(draft.title)
+                    .font(.title3.weight(.semibold))
+                Text(draft.caption)
+                    .foregroundStyle(.secondary)
+                Text(draft.visualDirection)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(4)
+            } else {
+                Text("Generate the release kit to create screenshot direction.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: 170, alignment: .topLeading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct NextActionPanel: View {
+    @Bindable var model: LaunchKitAppModel
+
+    var body: some View {
+        HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Next")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(nextTitle)
+                    .font(.headline)
+            }
+            Spacer()
+            Button(nextButtonTitle) {
+                model.prepareSafeFixReview()
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var nextTitle: String {
+        if !model.findings.isEmpty { return "Review the fixes LaunchKit found" }
+        return "Everything generated is ready to review"
+    }
+
+    private var nextButtonTitle: String {
+        if !model.findings.isEmpty { return "Review Fixes" }
+        return "Continue"
     }
 }
 
