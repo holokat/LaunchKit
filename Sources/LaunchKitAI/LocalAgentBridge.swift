@@ -300,6 +300,8 @@ public actor LocalAgentBridge {
             Workspaces: \(scan.workspaces.map(\.path).joined(separator: ", "))
             Package managers: \(scan.packageManagers.map(\.rawValue).joined(separator: ", "))
             Capabilities: \(scan.capabilities.map(\.rawValue).joined(separator: ", "))
+            App understanding:
+            \(scan.appContext.promptSummary)
             Findings:
             \(scan.findings.map { "- \($0.title): \($0.explanation)" }.joined(separator: "\n"))
             """
@@ -319,16 +321,24 @@ public actor LocalAgentBridge {
     }
 
     public nonisolated func screenshotDraftPrompt(provider: LocalAgentProvider, scan: ProjectScanResult?) -> String {
-        let appDescription = scan.map { "\($0.projectType.rawValue) app with \($0.capabilities.count) detected Apple capabilities" }
+        let appDescription = scan.map {
+            """
+            \($0.projectType.rawValue) app with \($0.capabilities.count) detected Apple capabilities.
+            \($0.appContext.promptSummary)
+            """
+        }
             ?? "Apple app preparing for App Store release"
         return """
         You are LaunchKit's \(provider.subscriptionLabel) asset director.
-        Generate one premium App Store screenshot concept for this app: \(appDescription).
+        Generate one premium App Store screenshot concept grounded in the app context below.
         Return three short labeled lines only:
         Title: ...
         Caption: ...
         Visual Direction: ...
         No markdown, no legal claims, no pricing claims.
+
+        App context:
+        \(appDescription)
         """
     }
 
@@ -341,6 +351,8 @@ public actor LocalAgentBridge {
             """
             Project type: \($0.projectType.rawValue)
             Capabilities: \($0.capabilities.map(\.rawValue).joined(separator: ", "))
+            App understanding:
+            \($0.appContext.promptSummary)
             Findings: \($0.findings.map { "\($0.title): \($0.explanation)" }.joined(separator: "\n"))
             """
         } ?? "No scan selected."
@@ -361,9 +373,10 @@ public actor LocalAgentBridge {
 
     public nonisolated func iapDraftPrompt(provider: LocalAgentProvider, scan: ProjectScanResult?) -> String {
         let detectedStoreKit = scan?.capabilities.contains(.inAppPurchase) == true
+        let appContext = scan?.appContext.promptSummary ?? "No app-specific product context was extracted."
         return """
         You are LaunchKit's \(provider.subscriptionLabel) payments planner.
-        Draft a local StoreKit/IAP setup plan for an Apple app.
+        Draft a local StoreKit/IAP setup plan for this Apple app based on app context.
         Return only concise field values:
         Use IAP: yes/no
         Setup Note: one short sentence
@@ -371,6 +384,9 @@ public actor LocalAgentBridge {
         Do not use markdown headings, bullets, long explanations, or implementation checklists.
         Do not choose live prices. Do not propose live App Store Connect mutations without explicit approval.
         StoreKit detected in scan: \(detectedStoreKit ? "yes" : "no")
+
+        App context:
+        \(appContext)
         """
     }
 

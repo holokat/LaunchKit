@@ -4,6 +4,7 @@ public struct ProjectScanResult: Codable, Hashable, Sendable {
     public var rootURL: URL
     public var detectedAt: Date
     public var projectType: ProjectType
+    public var appContext: ProjectAppContext
     public var xcodeProjects: [DiscoveredFile]
     public var workspaces: [DiscoveredFile]
     public var packageManagers: [PackageManager]
@@ -15,6 +16,7 @@ public struct ProjectScanResult: Codable, Hashable, Sendable {
         rootURL: URL,
         detectedAt: Date = Date(),
         projectType: ProjectType,
+        appContext: ProjectAppContext = ProjectAppContext(),
         xcodeProjects: [DiscoveredFile] = [],
         workspaces: [DiscoveredFile] = [],
         packageManagers: [PackageManager] = [],
@@ -25,12 +27,70 @@ public struct ProjectScanResult: Codable, Hashable, Sendable {
         self.rootURL = rootURL
         self.detectedAt = detectedAt
         self.projectType = projectType
+        self.appContext = appContext
         self.xcodeProjects = xcodeProjects
         self.workspaces = workspaces
         self.packageManagers = packageManagers
         self.targets = targets
         self.capabilities = capabilities
         self.findings = findings
+    }
+}
+
+public struct ProjectAppContext: Codable, Hashable, Sendable {
+    public var displayNameCandidates: [String]
+    public var bundleIdentifiers: [String]
+    public var descriptions: [String]
+    public var readmeExcerpts: [String]
+    public var manifestSignals: [String]
+    public var sourceStrings: [String]
+
+    public init(
+        displayNameCandidates: [String] = [],
+        bundleIdentifiers: [String] = [],
+        descriptions: [String] = [],
+        readmeExcerpts: [String] = [],
+        manifestSignals: [String] = [],
+        sourceStrings: [String] = []
+    ) {
+        self.displayNameCandidates = displayNameCandidates
+        self.bundleIdentifiers = bundleIdentifiers
+        self.descriptions = descriptions
+        self.readmeExcerpts = readmeExcerpts
+        self.manifestSignals = manifestSignals
+        self.sourceStrings = sourceStrings
+    }
+
+    public var preferredDisplayName: String? {
+        displayNameCandidates.first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    public var preferredDescription: String? {
+        descriptions.first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            ?? readmeExcerpts.first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    public var promptSummary: String {
+        var sections: [String] = []
+        if !displayNameCandidates.isEmpty {
+            sections.append("Name candidates: \(displayNameCandidates.prefix(6).joined(separator: ", "))")
+        }
+        if !bundleIdentifiers.isEmpty {
+            sections.append("Bundle identifiers: \(bundleIdentifiers.prefix(6).joined(separator: ", "))")
+        }
+        if !descriptions.isEmpty {
+            sections.append("Description signals:\n\(descriptions.prefix(4).map { "- \($0)" }.joined(separator: "\n"))")
+        }
+        if !readmeExcerpts.isEmpty {
+            sections.append("README excerpts:\n\(readmeExcerpts.prefix(3).map { "- \($0)" }.joined(separator: "\n"))")
+        }
+        if !manifestSignals.isEmpty {
+            sections.append("Manifest signals:\n\(manifestSignals.prefix(8).map { "- \($0)" }.joined(separator: "\n"))")
+        }
+        if !sourceStrings.isEmpty {
+            sections.append("Visible app strings:\n\(sourceStrings.prefix(16).map { "- \($0)" }.joined(separator: "\n"))")
+        }
+        return sections.isEmpty ? "No app-specific product context was extracted." : sections.joined(separator: "\n\n")
     }
 }
 
@@ -102,4 +162,3 @@ public enum DetectedCapability: String, Codable, CaseIterable, Sendable {
     case keychainSharing
     case signInWithApple
 }
-

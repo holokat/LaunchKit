@@ -15,6 +15,7 @@ public struct FileSystemProjectScanner: ProjectScanning {
             let projectType = detectProjectType(index)
             let packageManagers = detectPackageManagers(index)
             let capabilities = detectCapabilities(index)
+            let appContext = extractAppContext(index: index)
             var findings = detectFindings(index: index, projectType: projectType, capabilities: capabilities)
 
             if projectType == .unknown {
@@ -31,6 +32,7 @@ public struct FileSystemProjectScanner: ProjectScanning {
             return ProjectScanResult(
                 rootURL: rootURL,
                 projectType: projectType,
+                appContext: appContext,
                 xcodeProjects: index.files(withSuffix: ".xcodeproj").map { DiscoveredFile(path: $0, kind: "Xcode project") },
                 workspaces: index.files(withSuffix: ".xcworkspace").map { DiscoveredFile(path: $0, kind: "Xcode workspace") },
                 packageManagers: packageManagers,
@@ -49,6 +51,7 @@ private struct ProjectFileIndex: Sendable {
     init(rootURL: URL) throws {
         self.rootURL = rootURL
         let fileManager = FileManager.default
+        let resolvedRootPath = rootURL.resolvingSymlinksInPath().path
         var paths: [String] = []
 
         func walk(_ directoryURL: URL) throws {
@@ -59,7 +62,10 @@ private struct ProjectFileIndex: Sendable {
             )
 
             for child in children {
-                let relativePath = child.path.replacingOccurrences(of: rootURL.path + "/", with: "")
+                let childPath = child.resolvingSymlinksInPath().path
+                let relativePath = childPath.hasPrefix(resolvedRootPath + "/")
+                    ? String(childPath.dropFirst(resolvedRootPath.count + 1))
+                    : child.lastPathComponent
                 let basename = child.lastPathComponent
                 paths.append(relativePath)
 
@@ -183,6 +189,263 @@ private func detectCapabilities(_ index: ProjectFileIndex) -> [DetectedCapabilit
     }
 
     return capabilities.sorted { $0.rawValue < $1.rawValue }
+}
+
+private func extractAppContext(index: ProjectFileIndex) -> ProjectAppContext {
+    var names: [String] = []
+    var bundleIdentifiers: [String] = []
+    var descriptions: [String] = []
+    var readmeExcerpts: [String] = []
+    var manifestSignals: [String] = []
+    var sourceStrings: [String] = []
+
+    for path in index.relativePaths {
+        let basename = URL(fileURLWithPath: path).lastPathComponent
+        let lowercased = basename.lowercased()
+        let absoluteURL = index.rootURL.appending(path: path)
+
+        if lowercased == "readme.md" || lowercased == "readme" {
+            if let readme = readSmallTextFile(absoluteURL) {
+                readmeExcerpts.append(contentsOf: readmeProductExcerpts(readme))
+            }
+        }
+
+        if basename == "Package.swift", let package = readSmallTextFile(absoluteURL) {
+            names.append(contentsOf: quotedValues(after: "name:", in: package))
+            manifestSignals.append(contentsOf: manifestLines(from: package, prefixes: ["let package", "products:", "dependencies:", ".library", ".executable"]))
+        }
+
+        if basename == "package.json", let package = readSmallTextFile(absoluteURL) {
+            let parsed = parsePackageJSON(package)
+            names.append(contentsOf: parsed.names)
+            descriptions.append(contentsOf: parsed.descriptions)
+            manifestSignals.append(contentsOf: parsed.signals)
+        }
+
+        if basename == "pubspec.yaml", let pubspec = readSmallTextFile(absoluteURL) {
+            names.append(contentsOf: yamlValues(for: "name", in: pubspec))
+            descriptions.append(contentsOf: yamlValues(for: "description", in: pubspec))
+            manifestSignals.append(contentsOf: manifestLines(from: pubspec, prefixes: ["name:", "description:", "dependencies:"]))
+        }
+
+        if basename == "Info.plist" {
+            let parsed = parseInfoPlist(absoluteURL)
+            names.append(contentsOf: parsed.names)
+            bundleIdentifiers.append(contentsOf: parsed.bundleIdentifiers)
+            manifestSignals.append(contentsOf: parsed.signals)
+        }
+
+        if isSourceFile(path), sourceStrings.count < 80, let source = readSmallTextFile(absoluteURL, maxBytes: 90_000) {
+            sourceStrings.append(contentsOf: visibleStrings(from: source))
+        }
+    }
+
+    return ProjectAppContext(
+        displayNameCandidates: uniqueCleaned(names).prefixArray(8),
+        bundleIdentifiers: uniqueCleaned(bundleIdentifiers).prefixArray(8),
+        descriptions: uniqueCleaned(descriptions).prefixArray(8),
+        readmeExcerpts: uniqueCleaned(readmeExcerpts).prefixArray(5),
+        manifestSignals: uniqueCleaned(manifestSignals).prefixArray(12),
+        sourceStrings: uniqueCleaned(sourceStrings).prefixArray(24)
+    )
+}
+
+private func readSmallTextFile(_ url: URL, maxBytes: Int = 120_000) -> String? {
+    guard
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+        let size = attributes[.size] as? NSNumber,
+        size.intValue <= maxBytes,
+        let text = try? String(contentsOf: url, encoding: .utf8)
+    else {
+        return nil
+    }
+    return text
+}
+
+private func readmeProductExcerpts(_ text: String) -> [String] {
+    let lines = text
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .filter { !$0.hasPrefix("![") && !$0.hasPrefix("[!") }
+
+    var excerpts: [String] = []
+    if let title = lines.first(where: { $0.hasPrefix("#") }) {
+        excerpts.append(title.trimmingCharacters(in: CharacterSet(charactersIn: "# ")))
+    }
+    excerpts.append(contentsOf: lines.filter { !$0.hasPrefix("#") }.prefix(4))
+    return excerpts.map { clipped($0, maxLength: 240) }
+}
+
+private func parsePackageJSON(_ text: String) -> (names: [String], descriptions: [String], signals: [String]) {
+    guard
+        let data = text.data(using: .utf8),
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else {
+        return ([], [], [])
+    }
+
+    var names: [String] = []
+    var descriptions: [String] = []
+    var signals: [String] = []
+    for key in ["displayName", "productName", "name"] {
+        if let value = json[key] as? String {
+            names.append(value)
+            signals.append("\(key): \(value)")
+        }
+    }
+    if let description = json["description"] as? String {
+        descriptions.append(description)
+        signals.append("description: \(description)")
+    }
+    if let dependencies = json["dependencies"] as? [String: Any] {
+        signals.append("dependencies: \(dependencies.keys.sorted().prefix(12).joined(separator: ", "))")
+    }
+    return (names, descriptions, signals.map { clipped($0, maxLength: 220) })
+}
+
+private func parseInfoPlist(_ url: URL) -> (names: [String], bundleIdentifiers: [String], signals: [String]) {
+    guard
+        let data = try? Data(contentsOf: url),
+        let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
+    else {
+        return ([], [], [])
+    }
+
+    var names: [String] = []
+    var bundleIdentifiers: [String] = []
+    var signals: [String] = []
+    for key in ["CFBundleDisplayName", "CFBundleName"] {
+        if let value = plist[key] as? String, !value.contains("$(") {
+            names.append(value)
+            signals.append("\(key): \(value)")
+        }
+    }
+    if let bundleIdentifier = plist["CFBundleIdentifier"] as? String, !bundleIdentifier.contains("$(") {
+        bundleIdentifiers.append(bundleIdentifier)
+        signals.append("CFBundleIdentifier: \(bundleIdentifier)")
+    }
+    return (names, bundleIdentifiers, signals)
+}
+
+private func quotedValues(after marker: String, in text: String) -> [String] {
+    text
+        .split(separator: "\n")
+        .compactMap { line -> String? in
+            guard line.contains(marker) else { return nil }
+            let parts = line.split(separator: "\"")
+            guard parts.count >= 2 else { return nil }
+            return String(parts[1])
+        }
+}
+
+private func yamlValues(for key: String, in text: String) -> [String] {
+    text
+        .split(separator: "\n")
+        .compactMap { line -> String? in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.lowercased().hasPrefix("\(key.lowercased()):") else { return nil }
+            return trimmed
+                .dropFirst(key.count + 1)
+                .trimmingCharacters(in: CharacterSet(charactersIn: " \"'").union(.whitespacesAndNewlines))
+        }
+}
+
+private func manifestLines(from text: String, prefixes: [String]) -> [String] {
+    text
+        .split(separator: "\n")
+        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { line in
+            prefixes.contains { line.localizedCaseInsensitiveContains($0) }
+        }
+        .prefix(8)
+        .map { clipped($0, maxLength: 220) }
+}
+
+private func isSourceFile(_ path: String) -> Bool {
+    let lowercased = path.lowercased()
+    return lowercased.hasSuffix(".swift")
+        || lowercased.hasSuffix(".m")
+        || lowercased.hasSuffix(".mm")
+        || lowercased.hasSuffix(".tsx")
+        || lowercased.hasSuffix(".jsx")
+        || lowercased.hasSuffix(".dart")
+}
+
+private func visibleStrings(from source: String) -> [String] {
+    let markers = ["Text(", "Label(", "Button(", "navigationTitle(", "NSLocalizedString(", "String(localized:"]
+    return source
+        .split(separator: "\n")
+        .filter { line in markers.contains { line.contains($0) } }
+        .flatMap { quotedStringLiterals(in: String($0)) }
+        .filter { value in
+            value.count >= 3
+                && !value.contains("%@")
+                && !value.contains("\\(")
+                && value.rangeOfCharacter(from: .letters) != nil
+        }
+        .map { clipped($0, maxLength: 160) }
+}
+
+private func quotedStringLiterals(in line: String) -> [String] {
+    var values: [String] = []
+    var current = ""
+    var isInsideQuote = false
+    var isEscaped = false
+
+    for character in line {
+        if isEscaped {
+            current.append(character)
+            isEscaped = false
+            continue
+        }
+        if character == "\\" {
+            isEscaped = true
+            continue
+        }
+        if character == "\"" {
+            if isInsideQuote {
+                values.append(current)
+                current = ""
+            }
+            isInsideQuote.toggle()
+            continue
+        }
+        if isInsideQuote {
+            current.append(character)
+        }
+    }
+    return values
+}
+
+private func uniqueCleaned(_ values: [String]) -> [String] {
+    var seen = Set<String>()
+    var result: [String] = []
+    for value in values {
+        let cleaned = clipped(
+            value
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            maxLength: 260
+        )
+        guard !cleaned.isEmpty else { continue }
+        let key = cleaned.lowercased()
+        guard !seen.contains(key) else { continue }
+        seen.insert(key)
+        result.append(cleaned)
+    }
+    return result
+}
+
+private func clipped(_ value: String, maxLength: Int) -> String {
+    guard value.count > maxLength else { return value }
+    return String(value.prefix(maxLength)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+}
+
+private extension Array {
+    func prefixArray(_ maxLength: Int) -> [Element] {
+        Array(prefix(maxLength))
+    }
 }
 
 private func detectFindings(

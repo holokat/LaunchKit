@@ -380,10 +380,11 @@ final class LaunchKitAppModel {
             }
             let result = try await scanner.scan(rootURL: project.rootURL)
             updateReleaseKit(for: projectID) { kit in
+                let displayName = result.appContext.preferredDisplayName ?? project.name
                 kit.scanResult = result
                 kit.findings = result.findings
                 kit.metadataForm = AppStoreMetadataForm.fallback(projectName: project.name, scan: result)
-                kit.screenshotAssets = ScreenshotReviewAsset.defaults(projectName: project.name)
+                kit.screenshotAssets = ScreenshotReviewAsset.defaults(projectName: displayName)
                 kit.iapForm = IAPReviewForm.fallback(scan: result)
                 kit.riskStatus = .ready
                 kit.releaseKitStatus = "Writing release plan"
@@ -910,24 +911,52 @@ struct AppStoreMetadataForm: Hashable {
     var reviewNotes = ""
 
     static func fallback(projectName: String, scan: ProjectScanResult?) -> AppStoreMetadataForm {
+        let inferredName = scan?.appContext.preferredDisplayName ?? projectName
+        let inferredDescription = scan?.appContext.preferredDescription
         let projectType = scan?.projectType.rawValue ?? "Apple"
         let capabilities = scan?.capabilities.map(\.rawValue).joined(separator: ", ")
         return AppStoreMetadataForm(
-            name: projectName,
-            subtitle: "\(projectType) app ready for review",
+            name: inferredName,
+            subtitle: subtitleFallback(projectType: projectType, contextDescription: inferredDescription),
             promotionalText: "Review this short launch message before it appears in App Store Connect.",
-            description: """
-            \(projectName) is ready for App Store review.
-
-            Replace this draft with a clear customer-facing description of what the app does, who it helps, and the main benefit users should expect.
-            """,
-            keywords: keywordFallback(projectName: projectName, scan: scan),
+            description: descriptionFallback(projectName: inferredName, contextDescription: inferredDescription),
+            keywords: keywordFallback(projectName: inferredName, scan: scan),
             releaseNotes: "Initial App Store release candidate prepared with LaunchKit.",
             privacyNotes: capabilities?.isEmpty == false
                 ? "Review detected capabilities before answering App Store privacy questions: \(capabilities!)."
                 : "Review app data collection, tracking, account deletion, and third-party SDK behavior before submission.",
             reviewNotes: "Add demo credentials, reviewer instructions, or hardware/account requirements here before submission."
         )
+    }
+
+    private static func subtitleFallback(projectType: String, contextDescription: String?) -> String {
+        guard let contextDescription, !contextDescription.isEmpty else {
+            return "\(projectType) app ready for review"
+        }
+        let firstSentence = contextDescription
+            .split(separator: ".")
+            .first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let firstSentence, !firstSentence.isEmpty else {
+            return "\(projectType) app ready for review"
+        }
+        return String(firstSentence.prefix(70))
+    }
+
+    private static func descriptionFallback(projectName: String, contextDescription: String?) -> String {
+        if let contextDescription, !contextDescription.isEmpty {
+            return """
+            \(contextDescription)
+
+            Review this draft against the actual product experience before submitting to App Store Connect.
+            """
+        }
+        return """
+        \(projectName) is ready for App Store review.
+
+        Replace this draft with a clear customer-facing description of what the app does, who it helps, and the main benefit users should expect.
+        """
     }
 
     func applying(agentOutput: String) -> AppStoreMetadataForm {
