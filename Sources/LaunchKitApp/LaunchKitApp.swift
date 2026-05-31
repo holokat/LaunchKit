@@ -1489,6 +1489,38 @@ struct SectionStatusPill: View {
     }
 }
 
+struct LaunchKitPrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .padding(.horizontal, 24)
+            .frame(minHeight: 46)
+            .background(
+                isEnabled
+                    ? Color.accentColor.opacity(configuration.isPressed ? 0.82 : 0.94)
+                    : Color.secondary.opacity(0.18),
+                in: Capsule()
+            )
+            .foregroundStyle(.white)
+            .overlay {
+                Capsule()
+                    .stroke(.white.opacity(0.12), lineWidth: 1)
+            }
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .animation(.snappy(duration: 0.16), value: configuration.isPressed)
+            .opacity(isEnabled ? 1 : 0.58)
+    }
+}
+
+struct LaunchKitPressButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .animation(.snappy(duration: 0.16), value: configuration.isPressed)
+    }
+}
+
 struct AppListPane: View {
     @Bindable var model: LaunchKitAppModel
 
@@ -1646,12 +1678,14 @@ struct AppListRow: View {
             .padding(14)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(LaunchKitPressButtonStyle())
         .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(isSelected ? Color.accentColor.opacity(0.25) : .clear, lineWidth: 1)
         }
+        .animation(.smooth(duration: 0.18), value: isSelected)
+        .animation(.smooth(duration: 0.18), value: statusText)
     }
 
     private var icon: String {
@@ -1743,7 +1777,7 @@ struct SelectedAppHeader: View {
                     .frame(minWidth: 250, minHeight: 44)
             }
             .controlSize(.large)
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(LaunchKitPrimaryButtonStyle())
             .disabled(!model.isAIReady || kit.isGeneratingReleaseKit)
 
             if !model.isAIReady {
@@ -1768,6 +1802,7 @@ struct ReleaseKitReview: View {
         VStack(alignment: .leading, spacing: 16) {
             if kit.isGeneratingReleaseKit {
                 ProgressPanel(status: kit.releaseKitStatus)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
             if !kit.hasStartedReleaseKit {
@@ -1777,6 +1812,8 @@ struct ReleaseKitReview: View {
                 NextActionPanel(model: model, kit: kit)
             }
         }
+        .animation(.smooth(duration: 0.22), value: kit.releaseKitStatus)
+        .animation(.smooth(duration: 0.22), value: kit.hasStartedReleaseKit)
     }
 }
 
@@ -1998,7 +2035,7 @@ struct EditableSectionHeader<Content: View>: View {
             VStack(alignment: .leading, spacing: 14) {
                 content
             }
-            .launchKitGlassCard(padding: 20, radius: 22)
+            .launchKitGlassCard(padding: 20, radius: 32)
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
@@ -2112,14 +2149,15 @@ struct ScreenshotAssetRow: View {
                 model.deleteScreenshotAsset(projectID: projectID, assetID: asset.id)
             } label: {
                 Image(systemName: "trash")
+                    .frame(width: 40, height: 40)
             }
             .buttonStyle(.bordered)
             .help("Delete image")
         }
         .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.54), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.54), in: RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(.primary.opacity(0.06), lineWidth: 1)
         }
     }
@@ -2177,10 +2215,10 @@ struct ScreenshotPreviewCard: View {
             }
             .padding(14)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.18), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(.white.opacity(0.10), lineWidth: 1)
         }
     }
 }
@@ -2254,6 +2292,7 @@ struct IAPProductRow: View {
                     model.deleteIAPProduct(projectID: projectID, productID: product.id)
                 } label: {
                     Image(systemName: "trash")
+                        .frame(width: 40, height: 40)
                 }
                 .buttonStyle(.bordered)
                 .help("Delete product")
@@ -2278,9 +2317,9 @@ struct IAPProductRow: View {
             ReviewTextEditor(label: "Review note", text: textBinding(.reviewNote), minHeight: 70)
         }
         .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.54), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.54), in: RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(.primary.opacity(0.06), lineWidth: 1)
         }
     }
