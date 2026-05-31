@@ -330,11 +330,17 @@ public actor LocalAgentBridge {
             ?? "Apple app preparing for App Store release"
         return """
         You are LaunchKit's \(provider.subscriptionLabel) asset director.
-        Generate one premium App Store screenshot concept grounded in the app context below.
-        Return three short labeled lines only:
-        Title: ...
-        Caption: ...
-        Visual Direction: ...
+        Generate three premium App Store screenshot concepts grounded in the app context below.
+        Return only these exact labeled fields, repeated for each screenshot:
+        Screenshot 1 Title: ...
+        Screenshot 1 Caption: ...
+        Screenshot 1 Visual Direction: ...
+        Screenshot 2 Title: ...
+        Screenshot 2 Caption: ...
+        Screenshot 2 Visual Direction: ...
+        Screenshot 3 Title: ...
+        Screenshot 3 Caption: ...
+        Screenshot 3 Visual Direction: ...
         No markdown, no legal claims, no pricing claims.
 
         App context:
@@ -387,6 +393,46 @@ public actor LocalAgentBridge {
 
         App context:
         \(appContext)
+        """
+    }
+
+    public nonisolated func issueFixPrompt(
+        provider: LocalAgentProvider,
+        scan: ProjectScanResult?,
+        findingTitle: String,
+        findingExplanation: String,
+        recommendedFix: String?
+    ) -> String {
+        let projectFacts = scan.map {
+            """
+            Project type: \($0.projectType.rawValue)
+            Root: \($0.rootURL.path)
+            Xcode projects: \($0.xcodeProjects.map(\.path).joined(separator: ", "))
+            Workspaces: \($0.workspaces.map(\.path).joined(separator: ", "))
+            Capabilities: \($0.capabilities.map(\.rawValue).joined(separator: ", "))
+            App understanding:
+            \($0.appContext.promptSummary)
+            """
+        } ?? "No scan selected."
+
+        return """
+        You are LaunchKit's \(provider.subscriptionLabel) local release repair agent.
+        Create a focused fix plan for one LaunchKit finding.
+        Do not write markdown. Do not include shell logs. Do not ask the user generic questions.
+        Return only these exact fields:
+        Summary: one sentence
+        Files: comma-separated likely files to change or inspect
+        Steps: 2-5 concise actions separated by semicolons
+        Risk: low/medium/high
+        Approval Required: yes/no
+
+        Finding:
+        Title: \(findingTitle)
+        Explanation: \(findingExplanation)
+        Recommended fix: \(recommendedFix ?? "No recommendation provided.")
+
+        Project facts:
+        \(projectFacts)
         """
     }
 

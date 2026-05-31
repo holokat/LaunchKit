@@ -654,22 +654,10 @@ final class LaunchKitAppModel {
             updateReleaseKit(for: projectID) { kit in
                 let draft = GeneratedScreenshotDraft(output: output)
                 kit.generatedScreenshotDraft = draft
-                if kit.screenshotAssets.isEmpty {
-                    kit.screenshotAssets = [
-                        ScreenshotReviewAsset(
-                            title: draft.title,
-                            caption: draft.caption,
-                            device: "iPhone 6.7\"",
-                            visualDirection: draft.visualDirection,
-                            paletteIndex: draft.paletteIndex
-                        )
-                    ]
-                } else {
-                    kit.screenshotAssets[0].title = draft.title
-                    kit.screenshotAssets[0].caption = draft.caption
-                    kit.screenshotAssets[0].visualDirection = draft.visualDirection
-                    kit.screenshotAssets[0].paletteIndex = draft.paletteIndex
-                }
+                let fallback = kit.screenshotAssets.isEmpty
+                    ? ScreenshotReviewAsset.defaults(projectName: kit.metadataForm.name.isEmpty ? "App" : kit.metadataForm.name)
+                    : kit.screenshotAssets
+                kit.screenshotAssets = ScreenshotReviewAsset.generated(from: output, fallback: fallback)
                 kit.screenshotStatus = .review
                 kit.isGeneratingScreenshotDraft = false
                 kit.releaseKitStatus = "Screenshot draft ready"
@@ -730,6 +718,55 @@ final class LaunchKitAppModel {
             risk: reversibleWrites.isEmpty ? .informational : .medium
         ), at: 0)
         selectedScreen = .releasePlan
+    }
+
+    func fixFinding(projectID: String, findingID: UUID) async {
+        guard await ensureSelectedAgentConnected(phase: .fixing, taskName: "prepare a targeted fix") else { return }
+        guard let finding = releaseKits[projectID]?.findings.first(where: { $0.id == findingID }) else { return }
+        let scan = releaseKits[projectID]?.scanResult
+        let provider = selectedAIProvider
+
+        updateReleaseKit(for: projectID) { kit in
+            kit.fixDrafts[findingID] = IssueFixDraft(isRunning: true)
+        }
+
+        do {
+            let output = try await localAgentBridge.complete(
+                provider: provider,
+                prompt: localAgentBridge.issueFixPrompt(
+                    provider: provider,
+                    scan: scan,
+                    findingTitle: finding.title,
+                    findingExplanation: finding.explanation,
+                    recommendedFix: finding.recommendedFix
+                ),
+                workingDirectoryURL: scan?.rootURL
+            )
+            updateReleaseKit(for: projectID) { kit in
+                kit.fixDrafts[findingID] = IssueFixDraft.parsed(from: output)
+            }
+            events.insert(WorkflowEvent(
+                phase: .fixing,
+                title: "Fix prepared",
+                detail: finding.title,
+                risk: finding.risk
+            ), at: 0)
+        } catch {
+            updateReleaseKit(for: projectID) { kit in
+                kit.fixDrafts[findingID] = IssueFixDraft(
+                    isRunning: false,
+                    summary: "Could not generate this fix yet: \(error.localizedDescription)",
+                    risk: "medium",
+                    approvalRequired: "yes"
+                )
+            }
+            events.insert(WorkflowEvent(
+                phase: .fixing,
+                title: "Fix generation failed",
+                detail: error.localizedDescription,
+                risk: .medium
+            ), at: 0)
+        }
     }
 
     private func ensureSelectedAgentConnected(phase: WorkflowPhase, taskName: String) async -> Bool {
@@ -1057,14 +1094,12 @@ struct AppStoreMetadataForm: Hashable {
     }
 
     private static func cleanedHeading(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "**", with: "")
+        MarkdownCleaner.clean(value)
             .trimmingCharacters(in: CharacterSet(charactersIn: " -#`*").union(.whitespacesAndNewlines))
     }
 
     private static func cleanedBody(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "**", with: "")
+        MarkdownCleaner.clean(value)
             .trimmingCharacters(in: CharacterSet(charactersIn: " \t`"))
     }
 }
@@ -1073,6 +1108,21 @@ enum ScreenshotAssetField {
     case title
     case caption
     case device
+}
+
+enum MarkdownCleaner {
+    static func clean(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "__", with: "")
+            .replacingOccurrences(of: "`", with: "")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line in
+                line.trimmingCharacters(in: CharacterSet(charactersIn: " \t-*#•"))
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 struct ScreenshotReviewAsset: Identifiable, Hashable {
@@ -1109,6 +1159,51 @@ struct ScreenshotReviewAsset: Identifiable, Hashable {
         ]
     }
 
+    static func generated(from output: String, fallback: [ScreenshotReviewAsset]) -> [ScreenshotReviewAsset] {
+        let lines = output
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { MarkdownCleaner.clean(String($0)) }
+            .filter { !$0.isEmpty }
+
+        var assets: [ScreenshotReviewAsset] = []
+        for index in 1...3 {
+            let title = labeledValue("Screenshot \(index) Title", in: lines)
+                ?? (index == 1 ? labeledValue("Title", in: lines) : nil)
+                ?? fallback[safe: index - 1]?.title
+                ?? "Screenshot \(index)"
+            let caption = labeledValue("Screenshot \(index) Caption", in: lines)
+                ?? (index == 1 ? labeledValue("Caption", in: lines) : nil)
+                ?? fallback[safe: index - 1]?.caption
+                ?? "Add the caption users should see on this App Store image."
+            let visualDirection = labeledValue("Screenshot \(index) Visual Direction", in: lines)
+                ?? (index == 1 ? labeledValue("Visual Direction", in: lines) : nil)
+                ?? fallback[safe: index - 1]?.visualDirection
+                ?? "Generated screenshot slot ready for review."
+
+            assets.append(ScreenshotReviewAsset(
+                title: title,
+                caption: caption,
+                device: fallback[safe: index - 1]?.device ?? "iPhone 6.7\"",
+                visualDirection: visualDirection,
+                paletteIndex: index - 1
+            ))
+        }
+        return assets
+    }
+
+    private static func labeledValue(_ label: String, in lines: [String]) -> String? {
+        let lowercasedLabel = label.lowercased()
+        for line in lines {
+            let lowercased = line.lowercased()
+            guard lowercased.hasPrefix("\(lowercasedLabel):") else { continue }
+            let value = line
+                .dropFirst(label.count)
+                .trimmingCharacters(in: CharacterSet(charactersIn: ": ").union(.whitespacesAndNewlines))
+            return value.isEmpty ? nil : String(value)
+        }
+        return nil
+    }
+
     var palette: [Color] {
         GeneratedScreenshotDraft.palettes[paletteIndex % GeneratedScreenshotDraft.palettes.count]
     }
@@ -1119,6 +1214,12 @@ struct ScreenshotReviewAsset: Identifiable, Hashable {
         case .caption: caption = value
         case .device: device = value
         }
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
 
@@ -1190,9 +1291,75 @@ struct IAPReviewForm: Hashable {
     }
 }
 
+struct IssueFixDraft: Hashable {
+    var isRunning = false
+    var summary: String?
+    var files: String?
+    var steps: [String] = []
+    var risk: String?
+    var approvalRequired: String?
+
+    var buttonTitle: String {
+        isRunning ? "Fixing..." : (summary == nil ? "Fix" : "Regenerate Fix")
+    }
+
+    static func parsed(from output: String) -> IssueFixDraft {
+        let lines = output
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { MarkdownCleaner.clean(String($0)) }
+            .filter { !$0.isEmpty }
+
+        let stepsValue = labeledValue("Steps", in: lines)
+        let inlineSteps = stepsValue.map(parseSteps) ?? []
+        let followingSteps = lines
+            .drop { !$0.lowercased().hasPrefix("steps:") }
+            .dropFirst()
+            .prefix { line in
+                !["risk:", "approval required:", "summary:", "files:"].contains { line.lowercased().hasPrefix($0) }
+            }
+            .map(stripNumberPrefix)
+
+        return IssueFixDraft(
+            isRunning: false,
+            summary: labeledValue("Summary", in: lines) ?? MarkdownCleaner.clean(output),
+            files: labeledValue("Files", in: lines),
+            steps: inlineSteps.isEmpty ? Array(followingSteps.prefix(5)) : inlineSteps,
+            risk: labeledValue("Risk", in: lines),
+            approvalRequired: labeledValue("Approval Required", in: lines)
+        )
+    }
+
+    private static func labeledValue(_ label: String, in lines: [String]) -> String? {
+        let lowercasedLabel = label.lowercased()
+        for line in lines {
+            let lowercased = line.lowercased()
+            guard lowercased.hasPrefix("\(lowercasedLabel):") else { continue }
+            let value = line
+                .dropFirst(label.count)
+                .trimmingCharacters(in: CharacterSet(charactersIn: ": ").union(.whitespacesAndNewlines))
+            return value.isEmpty ? nil : String(value)
+        }
+        return nil
+    }
+
+    private static func parseSteps(_ value: String) -> [String] {
+        value
+            .split(separator: ";")
+            .map { stripNumberPrefix(String($0)) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func stripNumberPrefix(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: #"^\d+[\.\)]\s*"#, with: "", options: .regularExpression)
+    }
+}
+
 struct ReleaseKitState {
     var scanResult: ProjectScanResult?
     var findings: [DiagnosticFinding] = []
+    var fixDrafts: [UUID: IssueFixDraft] = [:]
     var metadataForm = AppStoreMetadataForm()
     var screenshotAssets: [ScreenshotReviewAsset] = []
     var iapForm = IAPReviewForm()
@@ -1292,9 +1459,15 @@ struct GeneratedScreenshotDraft: Identifiable, Hashable {
             .split(separator: "\n")
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        self.title = Self.value(after: "Title:", in: lines) ?? "Ship With Confidence"
-        self.caption = Self.value(after: "Caption:", in: lines) ?? "Every release step reviewed before it reaches Apple."
-        self.visualDirection = Self.value(after: "Visual Direction:", in: lines) ?? output
+        self.title = Self.value(for: "Screenshot 1 Title", in: lines)
+            ?? Self.value(for: "Title", in: lines)
+            ?? "Ship With Confidence"
+        self.caption = Self.value(for: "Screenshot 1 Caption", in: lines)
+            ?? Self.value(for: "Caption", in: lines)
+            ?? "Every release step reviewed before it reaches Apple."
+        self.visualDirection = Self.value(for: "Screenshot 1 Visual Direction", in: lines)
+            ?? Self.value(for: "Visual Direction", in: lines)
+            ?? output
         self.paletteIndex = abs(output.hashValue % Self.palettes.count)
     }
 
@@ -1327,10 +1500,18 @@ struct GeneratedScreenshotDraft: Identifiable, Hashable {
         ]
     ]
 
-    private static func value(after prefix: String, in lines: [String]) -> String? {
-        lines.first { $0.localizedCaseInsensitiveContains(prefix) }?
-            .replacingOccurrences(of: prefix, with: "", options: [.caseInsensitive])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    private static func value(for label: String, in lines: [String]) -> String? {
+        let lowercasedLabel = label.lowercased()
+        for line in lines {
+            let cleanedLine = MarkdownCleaner.clean(line)
+            guard cleanedLine.lowercased().hasPrefix("\(lowercasedLabel):") else { continue }
+            let value = cleanedLine
+                .dropFirst(label.count)
+                .trimmingCharacters(in: CharacterSet(charactersIn: ": ").union(.whitespacesAndNewlines))
+            guard !value.isEmpty else { continue }
+            return MarkdownCleaner.clean(value)
+        }
+        return nil
     }
 }
 
@@ -1939,26 +2120,14 @@ struct AppStoreReviewList: View {
                 content: kit.appleConnectionMessage
             )
 
-            AppStoreReviewSection(
-                title: "Compliance and fixes",
-                description: "Issues LaunchKit found that should be fixed or explicitly accepted before submission.",
-                icon: "exclamationmark.triangle",
-                status: kit.riskDisplayStatus,
-                content: complianceText
+            IssueChecklistSection(
+                model: model,
+                projectID: project.id,
+                findings: kit.findings,
+                fixDrafts: kit.fixDrafts,
+                status: kit.riskDisplayStatus
             )
         }
-    }
-
-    private var complianceText: String {
-        if kit.riskStatus == .pending {
-            return "Waiting for project scan."
-        }
-        if kit.findings.isEmpty {
-            return "No release blockers detected in the current scan."
-        }
-        return kit.findings
-            .map { "\($0.title)\n\($0.recommendedFix ?? $0.explanation)" }
-            .joined(separator: "\n\n")
     }
 
     private func metadataBinding(_ field: AppStoreMetadataField) -> Binding<String> {
@@ -2010,7 +2179,160 @@ struct AppStoreReviewSection: View {
 
     private var displayText: String {
         guard let text, !text.isEmpty else { return "Generate the release kit to fill this in." }
-        return text
+        return MarkdownCleaner.clean(text)
+    }
+}
+
+struct IssueChecklistSection: View {
+    @Bindable var model: LaunchKitAppModel
+    let projectID: String
+    let findings: [DiagnosticFinding]
+    let fixDrafts: [UUID: IssueFixDraft]
+    let status: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Compliance and fixes", systemImage: "exclamationmark.triangle")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                SectionStatusPill(status: status)
+            }
+            Text("Actionable items LaunchKit found. Use Fix to have the local AI prepare the exact repair plan for that row.")
+                .font(.body)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 12) {
+                if findings.isEmpty {
+                    HStack(spacing: 12) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text("No release blockers detected in the current scan.")
+                            .font(.headline)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    ForEach(findings) { finding in
+                        IssueChecklistRow(
+                            model: model,
+                            projectID: projectID,
+                            finding: finding,
+                            fixDraft: fixDrafts[finding.id]
+                        )
+                    }
+                }
+            }
+            .launchKitGlassCard(padding: 20, radius: 32)
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+}
+
+struct IssueChecklistRow: View {
+    @Bindable var model: LaunchKitAppModel
+    let projectID: String
+    let finding: DiagnosticFinding
+    let fixDraft: IssueFixDraft?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: icon)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 34, height: 34)
+                    .background(tint.opacity(0.12), in: Circle())
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(finding.title)
+                            .font(.headline)
+                        Text(finding.severity.rawValue.capitalized)
+                            .font(.caption.weight(.bold))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(.thinMaterial, in: Capsule())
+                    }
+                    Text(finding.explanation)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    if let recommendedFix = finding.recommendedFix {
+                        Text(recommendedFix)
+                            .font(.callout.weight(.semibold))
+                    }
+                    if !finding.affectedPaths.isEmpty {
+                        Text(finding.affectedPaths.joined(separator: ", "))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(2)
+                    }
+                }
+
+                Spacer()
+
+                Button {
+                    Task { await model.fixFinding(projectID: projectID, findingID: finding.id) }
+                } label: {
+                    Label(fixDraft?.buttonTitle ?? "Fix", systemImage: fixDraft?.isRunning == true ? "sparkles" : "wand.and.sparkles")
+                        .frame(minWidth: 104, minHeight: 40)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(fixDraft?.isRunning == true)
+            }
+
+            if let fixDraft, let summary = fixDraft.summary {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(summary)
+                        .font(.callout.weight(.semibold))
+                    if let files = fixDraft.files, !files.isEmpty {
+                        Label(files, systemImage: "doc")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(fixDraft.steps.enumerated()), id: \.offset) { index, step in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text("\(index + 1)")
+                                .font(.caption.weight(.bold))
+                                .frame(width: 20, height: 20)
+                                .background(.thinMaterial, in: Circle())
+                            Text(step)
+                                .font(.callout)
+                        }
+                    }
+                    if let risk = fixDraft.risk {
+                        Text("Risk: \(risk.capitalized)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.54), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            }
+        }
+        .padding(16)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.54), in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(.primary.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private var icon: String {
+        switch finding.severity {
+        case .info: "info.circle"
+        case .warning: "exclamationmark.triangle"
+        case .error: "xmark.octagon"
+        case .blocker: "hand.raised.fill"
+        }
+    }
+
+    private var tint: Color {
+        switch finding.severity {
+        case .info: .blue
+        case .warning: .orange
+        case .error, .blocker: .red
+        }
     }
 }
 
